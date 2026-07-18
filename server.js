@@ -770,7 +770,7 @@ app.post("/checkout", async (req, res) => {
                         name: displayName,
                         description: [
                             `PC ID: ${pcId}`,
-                            `Base Rent: $${baseRent.toFixed(2)}/mo`,
+                            `Base Rent: $${(safeBuyout ? baseRent * 0.8 : baseRent).toFixed(2)}/mo`,
                             `Buyout: ${safeBuyout ? "Enabled" : "Disabled"}`,
                             `Months Selected: ${safeMonths}`,
                             `Ownership Credit: $${ownershipRate.toFixed(2)}/mo`,
@@ -778,7 +778,7 @@ app.post("/checkout", async (req, res) => {
                         ].join(" | "),
                         images: pc.image ? [pc.image] : []
                     },
-                    unit_amount: Math.round(rentPerMonth * 100),
+                    unit_amount: Math.round(totalPerMonth * 100),
                     recurring: {
                         interval: "month"
                     }
