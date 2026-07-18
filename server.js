@@ -710,9 +710,11 @@ app.post("/checkout", async (req, res) => {
     const safeMonths = clampMonths(months);
     const safeBuyout = Boolean(buyout);
       
-    console.log("OWNERSHIP DEBUG:", {
-      buyout,
-      ownershipExtra
+    console.log("OWNERSHIP DEBUG BEFORE PRICING:", {
+        buyout,
+        safeBuyout,
+        ownershipExtra,
+        type: typeof ownershipExtra
     });
 
     const {
@@ -726,7 +728,14 @@ app.post("/checkout", async (req, res) => {
         pcValue,
         months: safeMonths,
         buyout: safeBuyout,
-        ownershipExtra
+        ownershipExtra: Number(ownershipExtra || 0)
+    });
+
+    console.log("OWNERSHIP DEBUG AFTER PRICING:", {
+        ownershipRate,
+        totalOwnership,
+        remainingBuyout,
+        totalPerMonth
     });
 
     if (!Number.isFinite(totalPerMonth) || totalPerMonth <= 0) {
