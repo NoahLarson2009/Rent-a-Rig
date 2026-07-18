@@ -111,7 +111,17 @@ app.post("/webhook", express.raw({ type: "application/json" }), async (req, res)
                     buyoutPaid: true,
                     buyoutPaidAt: admin.firestore.FieldValue.serverTimestamp(),
                     buyoutSessionId: checkoutSession.id,
+
+                    // Actual Stripe amount paid
                     buyoutAmountPaid: Number(checkoutSession.amount_total || 0) / 100,
+
+                    // Your calculated custom buyout amount
+                    customBuyoutAmount: Number(checkoutSession.metadata.buyoutAmount || 0),
+
+                    buyoutMonthsPaid: Number(checkoutSession.metadata.monthsPaid || 0),
+                    buyoutPcValue: Number(checkoutSession.metadata.pcValue || 0),
+                    buyoutOwnershipRate: Number(checkoutSession.metadata.ownershipRate || 0),
+
                     status: "bought_out",
                     paymentStatus: "buyout_paid"
                 });
@@ -1160,7 +1170,11 @@ app.post("/buyout", async (req, res) => {
       ],
       metadata: {
         type: "buyout",
-        orderId
+        orderId,
+        buyoutAmount: remainingBuyout.toFixed(2),
+        monthsPaid: String(monthsPaid),
+        pcValue: String(pcValue),
+        ownershipRate: String(ownershipRate)
       },
       success_url: "https://rent-a-gaming-rig.com/success.html?buyout=true&session_id={CHECKOUT_SESSION_ID}",
       cancel_url: "https://rent-a-gaming-rig.com/orders.html?buyout=cancelled"
