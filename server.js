@@ -778,7 +778,7 @@ app.post("/checkout", async (req, res) => {
                         ].join(" | "),
                         images: pc.image ? [pc.image] : []
                     },
-                    unit_amount: Math.round(totalPerMonth * 100),
+                    unit_amount: Math.round(rentPerMonth * 100),
                     recurring: {
                         interval: "month"
                     }
