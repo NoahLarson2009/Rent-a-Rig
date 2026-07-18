@@ -9,58 +9,10 @@ const app = express();
 
 app.use(cors({ origin: "*" }));
 
-// ================= ENV CHECKS =================
-if (!process.env.STRIPE_SECRET_KEY) {
-  throw new Error("Missing STRIPE_SECRET_KEY in .env");
-}
-
-if (!process.env.FIREBASE_PROJECT_ID) {
-  throw new Error("Missing FIREBASE_PROJECT_ID in .env");
-}
-
-if (!process.env.FIREBASE_CLIENT_EMAIL) {
-  throw new Error("Missing FIREBASE_CLIENT_EMAIL in .env");
-}
-
-if (!process.env.FIREBASE_PRIVATE_KEY) {
-  throw new Error("Missing FIREBASE_PRIVATE_KEY in .env");
-}
-
-// ================= STRIPE =================
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
-
-// ================= FIREBASE =================
-if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert({
-      projectId: process.env.FIREBASE_PROJECT_ID,
-      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n")
-    }),
-    storageBucket: `${process.env.FIREBASE_PROJECT_ID}.appspot.com`
-  });
-}
-
-const db = admin.firestore();
-
-
 // ================= WEBHOOK (MUST BE BEFORE express.json) =================
 app.post("/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   try {
-
-    const sig = req.headers["stripe-signature"];
-
-    let event;
-
-    if (process.env.STRIPE_WEBHOOK_SECRET) {
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        sig,
-        process.env.STRIPE_WEBHOOK_SECRET
-      );
-    } else {
-      event = JSON.parse(req.body.toString());
-    }
+    const event = JSON.parse(req.body.toString());
 
     console.log("WEBHOOK RECEIVED:", event.type);
 
@@ -368,6 +320,32 @@ app.post("/webhook", express.raw({ type: "application/json" }), async (req, res)
 // ================= NORMAL JSON (AFTER WEBHOOK) =================
 app.use(express.json());
 
+if (!process.env.STRIPE_SECRET_KEY) {
+  throw new Error("Missing STRIPE_SECRET_KEY in .env");
+}
+if (!process.env.FIREBASE_PROJECT_ID) {
+  throw new Error("Missing FIREBASE_PROJECT_ID in .env");
+}
+if (!process.env.FIREBASE_CLIENT_EMAIL) {
+  throw new Error("Missing FIREBASE_CLIENT_EMAIL in .env");
+}
+if (!process.env.FIREBASE_PRIVATE_KEY) {
+  throw new Error("Missing FIREBASE_PRIVATE_KEY in .env");
+}
+
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert({
+      projectId: process.env.FIREBASE_PROJECT_ID,
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+      privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n")
+    }),
+    storageBucket: `${process.env.FIREBASE_PROJECT_ID}.appspot.com`
+  });
+}
+
 app.post("/custom-build-deposit", async (req, res) => {
     try {
         const {
@@ -399,13 +377,6 @@ app.post("/custom-build-deposit", async (req, res) => {
                 error: "Missing required fields."
             });
         }
-        console.log("CHECKOUT PRICING DEBUG:", {
-            baseRent,
-            totalPerMonth,
-            ownershipRate,
-            rentPerMonth,
-            safeBuyout
-        });
 
         const session = await stripe.checkout.sessions.create({
             mode: "payment",
@@ -590,36 +561,25 @@ function clampMonths(value) {
 
 function buildPricing({ baseRent, pcValue, months, buyout }) {
 
-  const totalPerMonth = Number(baseRent.toFixed(2));
+  // Customer pays the normal monthly rent
+  const totalPerMonth = baseRent;
 
+  // 20% of every payment goes toward ownership
   const ownershipRate = buyout
-    ? Number((totalPerMonth * 0.20).toFixed(2))
+    ? totalPerMonth * 0.20
     : 0;
 
-  const rentPerMonth = Number(
-    (totalPerMonth - ownershipRate).toFixed(2)
-  );
+  const rentPerMonth = totalPerMonth;
 
-  const ownershipPercent = buyout ? 20 : 0;
-
-  const totalOwnership = Number(
-    (ownershipRate * months).toFixed(2)
-  );
+  const totalOwnership = ownershipRate * months;
 
   const remainingBuyout = buyout
-    ? Math.max(Number((pcValue - totalOwnership).toFixed(2)), 0)
+    ? Math.max(pcValue - totalOwnership, 0)
     : pcValue;
-
-  console.log("OWNERSHIP CALC:", {
-    baseRent: totalPerMonth,
-    ownershipRate,
-    rentPerMonth
-  });
 
   return {
     rentPerMonth,
     ownershipRate,
-    ownershipPercent,
     totalOwnership,
     remainingBuyout,
     totalPerMonth
@@ -740,7 +700,6 @@ app.post("/checkout", async (req, res) => {
     const {
         rentPerMonth,
         ownershipRate,
-        ownershipPercent,
         totalOwnership,
         remainingBuyout,
         totalPerMonth
@@ -782,7 +741,7 @@ app.post("/checkout", async (req, res) => {
                             `Base Rent: $${baseRent.toFixed(2)}/mo`,
                             `Buyout: ${safeBuyout ? "Enabled" : "Disabled"}`,
                             `Months Selected: ${safeMonths}`,
-                            `Ownership Credit: ${ownershipPercent}% ($${ownershipRate.toFixed(2)}/mo)`,
+                            `Ownership Credit: $${ownershipRate.toFixed(2)}/mo`,
                             `Remaining Buyout After Term: $${remainingBuyout.toFixed(2)}`
                         ].join(" | "),
                         images: pc.image ? [pc.image] : []
@@ -827,7 +786,6 @@ app.post("/checkout", async (req, res) => {
                         monthsPaid: "0",
                         buyout: String(safeBuyout),
                         ownershipRate: ownershipRate.toFixed(2),
-                        ownershipPercent: String(ownershipPercent),
                         remainingBuyout: remainingBuyout.toFixed(2),
                         rentPerMonth: rentPerMonth.toFixed(2),
                         totalPerMonth: totalPerMonth.toFixed(2)
@@ -1339,7 +1297,9 @@ app.post("/cancel-order", async (req, res) => {
     const totalPerMonth = Number(order.totalPerMonth || 0);
     const rentPerMonth = Number(order.rentPerMonth || 0);
 
-    const normalBaseRent = rentPerMonth;
+    const normalBaseRent = order.buyout === true
+      ? rentPerMonth + 25
+      : rentPerMonth;
 
     const extraPaidPerMonth = Math.max(totalPerMonth - normalBaseRent, 0);
     let remainingRefund = Math.round(extraPaidPerMonth * monthsPaid * 100);
