@@ -5,14 +5,64 @@ const admin = require("firebase-admin");
 const nodemailer = require("nodemailer");
 require("dotenv").config();
 
+console.log("RENT A RIG BACKEND VERSION 20% OWNERSHIP");
+
 const app = express();
 
 app.use(cors({ origin: "*" }));
 
+// ================= ENV CHECKS =================
+if (!process.env.STRIPE_SECRET_KEY) {
+  throw new Error("Missing STRIPE_SECRET_KEY in .env");
+}
+
+if (!process.env.FIREBASE_PROJECT_ID) {
+  throw new Error("Missing FIREBASE_PROJECT_ID in .env");
+}
+
+if (!process.env.FIREBASE_CLIENT_EMAIL) {
+  throw new Error("Missing FIREBASE_CLIENT_EMAIL in .env");
+}
+
+if (!process.env.FIREBASE_PRIVATE_KEY) {
+  throw new Error("Missing FIREBASE_PRIVATE_KEY in .env");
+}
+
+// ================= STRIPE =================
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+
+// ================= FIREBASE =================
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert({
+      projectId: process.env.FIREBASE_PROJECT_ID,
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+      privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n")
+    }),
+    storageBucket: `${process.env.FIREBASE_PROJECT_ID}.appspot.com`
+  });
+}
+
+const db = admin.firestore();
+
+
 // ================= WEBHOOK (MUST BE BEFORE express.json) =================
 app.post("/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   try {
-    const event = JSON.parse(req.body.toString());
+
+    const sig = req.headers["stripe-signature"];
+
+    let event;
+
+    if (process.env.STRIPE_WEBHOOK_SECRET) {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } else {
+      event = JSON.parse(req.body.toString());
+    }
 
     console.log("WEBHOOK RECEIVED:", event.type);
 
@@ -320,32 +370,6 @@ app.post("/webhook", express.raw({ type: "application/json" }), async (req, res)
 // ================= NORMAL JSON (AFTER WEBHOOK) =================
 app.use(express.json());
 
-if (!process.env.STRIPE_SECRET_KEY) {
-  throw new Error("Missing STRIPE_SECRET_KEY in .env");
-}
-if (!process.env.FIREBASE_PROJECT_ID) {
-  throw new Error("Missing FIREBASE_PROJECT_ID in .env");
-}
-if (!process.env.FIREBASE_CLIENT_EMAIL) {
-  throw new Error("Missing FIREBASE_CLIENT_EMAIL in .env");
-}
-if (!process.env.FIREBASE_PRIVATE_KEY) {
-  throw new Error("Missing FIREBASE_PRIVATE_KEY in .env");
-}
-
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
-
-if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert({
-      projectId: process.env.FIREBASE_PROJECT_ID,
-      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n")
-    }),
-    storageBucket: `${process.env.FIREBASE_PROJECT_ID}.appspot.com`
-  });
-}
-
 app.post("/custom-build-deposit", async (req, res) => {
     try {
         const {
@@ -377,6 +401,13 @@ app.post("/custom-build-deposit", async (req, res) => {
                 error: "Missing required fields."
             });
         }
+        console.log("CHECKOUT PRICING DEBUG:", {
+            baseRent,
+            totalPerMonth,
+            ownershipRate,
+            rentPerMonth,
+            safeBuyout
+        });
 
         const session = await stripe.checkout.sessions.create({
             mode: "payment",
@@ -551,16 +582,6 @@ function toMoneyNumber(value, fallback = 0) {
   return Number.isFinite(num) ? num : fallback;
 }
 
-function clampMultiplier(value) {
-  const num = Number(value);
-
-  if (!Number.isFinite(num)) return 25;
-  if (num < 25) return 25;
-  if (num > 500) return 500;
-
-  return Math.round(num);
-}
-
 function clampMonths(value) {
   const num = Number(value);
   if (!Number.isFinite(num)) return 1;
@@ -569,27 +590,38 @@ function clampMonths(value) {
   return Math.floor(num);
 }
 
-function buildPricing({ baseRent, pcValue, months, buyout, multiplier }) {
+function buildPricing({ baseRent, pcValue, months, buyout }) {
+
+  const totalPerMonth = Number(baseRent.toFixed(2));
 
   const ownershipRate = buyout
-    ? Number(multiplier || 25)
+    ? Number((totalPerMonth * 0.20).toFixed(2))
     : 0;
 
-  const rentPerMonth = buyout
-    ? baseRent - 25
-    : baseRent;
+  const rentPerMonth = Number(
+    (totalPerMonth - ownershipRate).toFixed(2)
+  );
 
-  const totalPerMonth = rentPerMonth + ownershipRate;
+  const ownershipPercent = buyout ? 20 : 0;
 
-  const totalOwnership = ownershipRate * months;
+  const totalOwnership = Number(
+    (ownershipRate * months).toFixed(2)
+  );
 
   const remainingBuyout = buyout
-    ? Math.max(pcValue - totalOwnership, 0)
+    ? Math.max(Number((pcValue - totalOwnership).toFixed(2)), 0)
     : pcValue;
+
+  console.log("OWNERSHIP CALC:", {
+    baseRent: totalPerMonth,
+    ownershipRate,
+    rentPerMonth
+  });
 
   return {
     rentPerMonth,
     ownershipRate,
+    ownershipPercent,
     totalOwnership,
     remainingBuyout,
     totalPerMonth
@@ -658,7 +690,6 @@ app.post("/checkout", async (req, res) => {
     months,
     monthsPaid,
     buyout,
-    multiplier,
     ageConfirmed,
   } = req.body;
 
@@ -707,20 +738,19 @@ app.post("/checkout", async (req, res) => {
 
     const safeMonths = clampMonths(months);
     const safeBuyout = Boolean(buyout);
-    const safeMultiplier = clampMultiplier(multiplier);
 
     const {
-      rentPerMonth,
-      ownershipRate,
-      totalOwnership,
-      remainingBuyout,
-      totalPerMonth
+        rentPerMonth,
+        ownershipRate,
+        ownershipPercent,
+        totalOwnership,
+        remainingBuyout,
+        totalPerMonth
     } = buildPricing({
-      baseRent,
-      pcValue,
-      months: safeMonths,
-      buyout: safeBuyout,
-      multiplier: safeMultiplier
+        baseRent,
+        pcValue,
+        months: safeMonths,
+        buyout: safeBuyout
     });
 
     if (!Number.isFinite(totalPerMonth) || totalPerMonth <= 0) {
@@ -731,16 +761,11 @@ app.post("/checkout", async (req, res) => {
 
     if (!isCustomBuild) {
       pcRef = db.collection("pcs").doc(pcId);
+
       const pcSnap = await pcRef.get();
 
       if (!pcSnap.exists) {
         return res.status(404).json({ error: "PC not found" });
-      }
-
-      const pcData = pcSnap.data() || {};
-
-      if (pcData.available === false || pcData.rented === true) {
-        return res.status(400).json({ error: "This PC has already been rented." });
       }
     }
 
@@ -758,9 +783,8 @@ app.post("/checkout", async (req, res) => {
                             `PC ID: ${pcId}`,
                             `Base Rent: $${baseRent.toFixed(2)}/mo`,
                             `Buyout: ${safeBuyout ? "Enabled" : "Disabled"}`,
-                            `Multiplier: ${safeMultiplier.toFixed(1)}x`,
                             `Months Selected: ${safeMonths}`,
-                            `Ownership Credit: $${ownershipRate.toFixed(2)}/mo`,
+                            `Ownership Credit: ${ownershipPercent}% ($${ownershipRate.toFixed(2)}/mo)`,
                             `Remaining Buyout After Term: $${remainingBuyout.toFixed(2)}`
                         ].join(" | "),
                         images: pc.image ? [pc.image] : []
@@ -804,8 +828,8 @@ app.post("/checkout", async (req, res) => {
                         months: String(safeMonths),
                         monthsPaid: "0",
                         buyout: String(safeBuyout),
-                        multiplier: String(safeMultiplier),
                         ownershipRate: ownershipRate.toFixed(2),
+                        ownershipPercent: String(ownershipPercent),
                         remainingBuyout: remainingBuyout.toFixed(2),
                         rentPerMonth: rentPerMonth.toFixed(2),
                         totalPerMonth: totalPerMonth.toFixed(2)
@@ -829,7 +853,6 @@ app.post("/checkout", async (req, res) => {
         pcValue,
         months: safeMonths,
         buyout: safeBuyout,
-        multiplier: safeMultiplier,
         rentPerMonth,
         ownershipRate,
         totalOwnership,
@@ -984,16 +1007,7 @@ app.post("/verify-session", async (req, res) => {
             userId: order.userId,
             pcId: order.pcId,
            finalizedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-
-        if (pcRef) {
-            tx.update(pcRef, {
-                available: false,
-                rented: true,
-                rentedBy: order.userId,
-                rentedAt: admin.firestore.FieldValue.serverTimestamp()
-            });
-        }   
+        });   
     });
 
     if (metadata.originalCustomBuildOrderId) {
@@ -1050,30 +1064,27 @@ app.post("/verify-session", async (req, res) => {
 /* ================= BUYOUT QUOTE ================= */
 app.post("/buyout-quote", async (req, res) => {
   try {
-    const { pcId, monthsPaid, multiplier } = req.body;
+    const { pcId, monthsPaid } = req.body;
 
     if (!pcId || typeof pcId !== "string") {
       return res.status(400).json({ error: "Missing or invalid pcId" });
     }
 
     const safeMonthsPaid = clampMonths(monthsPaid);
-    const safeMultiplier = clampMultiplier(multiplier);
 
     const { baseRent, pcValue, displayName } = await getPcOrThrow(pcId);
 
     const pricing = buildPricing({
-      baseRent,
-      pcValue,
-      months: safeMonthsPaid,
-      buyout: true,
-      multiplier: safeMultiplier
+        baseRent,
+        pcValue,
+        months: safeMonthsPaid,
+        buyout: true
     });
 
     res.json({
       pcId,
       displayName,
       monthsPaid: safeMonthsPaid,
-      multiplier: safeMultiplier,
       ownershipRate: pricing.ownershipRate,
       totalOwnership: pricing.totalOwnership,
       remainingBuyout: pricing.remainingBuyout
@@ -1161,7 +1172,11 @@ app.post("/buyout", async (req, res) => {
 
     const pcValue = Number(order.pcValue || 0);
     const ownershipRate = Number(order.ownershipRate || 0);
-    const remainingBuyout = Math.max(pcValue - (ownershipRate * monthsPaid), 0);
+
+    const remainingBuyout = Math.max(
+        pcValue - (ownershipRate * monthsPaid),
+        0
+    );
 
     if (!Number.isFinite(remainingBuyout) || remainingBuyout <= 0) {
       return res.status(400).json({ error: "No remaining buyout balance" });
@@ -1326,9 +1341,7 @@ app.post("/cancel-order", async (req, res) => {
     const totalPerMonth = Number(order.totalPerMonth || 0);
     const rentPerMonth = Number(order.rentPerMonth || 0);
 
-    const normalBaseRent = order.buyout === true
-      ? rentPerMonth + 25
-      : rentPerMonth;
+    const normalBaseRent = rentPerMonth;
 
     const extraPaidPerMonth = Math.max(totalPerMonth - normalBaseRent, 0);
     let remainingRefund = Math.round(extraPaidPerMonth * monthsPaid * 100);
