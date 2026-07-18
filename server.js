@@ -586,7 +586,7 @@ function buildPricing({ baseRent, pcValue, months, buyout, ownershipExtra }) {
   const totalOwnership = ownershipRate * months;
 
   const remainingBuyout = buyout
-    ? Math.max(pcValue - totalOwnership, 0)
+    ? pcValue
     : pcValue;
 
   return {
@@ -926,7 +926,7 @@ app.post("/verify-session", async (req, res) => {
       buyout: metadata.buyout === "true",
       multiplier: Number(metadata.multiplier || 1),
       ownershipRate: Number(metadata.ownershipRate || 0),
-      remainingBuyout: Number(metadata.remainingBuyout || 0),
+      remainingBuyout: remainingBuyout.toFixed(2),
       rentPerMonth: Number(metadata.rentPerMonth || 0),
       totalPerMonth: Number(metadata.totalPerMonth || 0),
       paymentStatus: isOneMonth ? "cancelled" : "paid",
