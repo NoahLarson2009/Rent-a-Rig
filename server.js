@@ -571,14 +571,14 @@ function clampMonths(value) {
 
 function buildPricing({ baseRent, pcValue, months, buyout, ownershipExtra }) {
 
-  // Customer pays rent + custom ownership amount
+  // Customer pays rent + ownership credit when buyout is enabled
   const totalPerMonth = buyout
     ? baseRent + Number(ownershipExtra || 0)
     : baseRent;
 
-  // 20% of the total payment goes toward ownership
+  // Ownership credit is the exact amount selected
   const ownershipRate = buyout
-    ? totalPerMonth * 0.20
+    ? Number(ownershipExtra || 0)
     : 0;
 
   const rentPerMonth = totalPerMonth;
