@@ -569,12 +569,14 @@ function clampMonths(value) {
   return Math.floor(num);
 }
 
-function buildPricing({ baseRent, pcValue, months, buyout }) {
+function buildPricing({ baseRent, pcValue, months, buyout, ownershipExtra }) {
 
-  // Customer pays the normal monthly rent
-  const totalPerMonth = baseRent;
+  // Customer pays rent + custom ownership amount
+  const totalPerMonth = buyout
+    ? baseRent + Number(ownershipExtra || 0)
+    : baseRent;
 
-  // 20% of every payment goes toward ownership
+  // 20% of the total payment goes toward ownership
   const ownershipRate = buyout
     ? totalPerMonth * 0.20
     : 0;
@@ -658,8 +660,9 @@ app.post("/checkout", async (req, res) => {
     months,
     monthsPaid,
     buyout,
+    ownershipExtra,
     ageConfirmed,
-  } = req.body;
+      } = req.body;
 
     if (ageConfirmed !== true) {
       return res.status(403).json({
@@ -717,7 +720,8 @@ app.post("/checkout", async (req, res) => {
         baseRent,
         pcValue,
         months: safeMonths,
-        buyout: safeBuyout
+        buyout: safeBuyout,
+        ownershipExtra
     });
 
     if (!Number.isFinite(totalPerMonth) || totalPerMonth <= 0) {
