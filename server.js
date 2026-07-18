@@ -1034,7 +1034,7 @@ app.post("/verify-session", async (req, res) => {
 /* ================= BUYOUT QUOTE ================= */
 app.post("/buyout-quote", async (req, res) => {
   try {
-    const { pcId, monthsPaid } = req.body;
+    const { pcId, monthsPaid, ownershipExtra } = req.body;
 
     if (!pcId || typeof pcId !== "string") {
       return res.status(400).json({ error: "Missing or invalid pcId" });
@@ -1044,11 +1044,14 @@ app.post("/buyout-quote", async (req, res) => {
 
     const { baseRent, pcValue, displayName } = await getPcOrThrow(pcId);
 
+    const ownershipExtra = 25; // or whatever your ownership credit amount is
+
     const pricing = buildPricing({
         baseRent,
         pcValue,
         months: safeMonthsPaid,
-        buyout: true
+        buyout: true,
+        ownershipExtra
     });
 
     res.json({
