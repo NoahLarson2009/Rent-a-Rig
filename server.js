@@ -5,8 +5,6 @@ const admin = require("firebase-admin");
 const nodemailer = require("nodemailer");
 require("dotenv").config();
 
-console.log("RENT A RIG BACKEND VERSION 20% OWNERSHIP");
-
 const app = express();
 
 app.use(cors({ origin: "*" }));
