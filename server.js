@@ -586,7 +586,7 @@ function buildPricing({ baseRent, pcValue, months, buyout, ownershipExtra }) {
   const totalOwnership = ownershipRate * months;
 
   const remainingBuyout = buyout
-    ? pcValue
+    ? Math.max(pcValue - totalOwnership, 0)
     : pcValue;
 
   return {
@@ -709,6 +709,11 @@ app.post("/checkout", async (req, res) => {
 
     const safeMonths = clampMonths(months);
     const safeBuyout = Boolean(buyout);
+      
+    console.log("OWNERSHIP DEBUG:", {
+      buyout,
+      ownershipExtra
+    });
 
     const {
         rentPerMonth,
@@ -892,6 +897,12 @@ app.post("/verify-session", async (req, res) => {
     const months = Number(metadata.months);
     const isOneMonth = months <= 1;
 
+    const remainingBuyout = Math.max(
+      Number(metadata.pcValue || 0) -
+      (Number(metadata.ownershipRate || 0) * 1),
+      0
+    );
+
     if (subscriptionId && isOneMonth) {
       await stripe.subscriptions.cancel(subscriptionId);
     }
@@ -1034,7 +1045,7 @@ app.post("/verify-session", async (req, res) => {
 /* ================= BUYOUT QUOTE ================= */
 app.post("/buyout-quote", async (req, res) => {
   try {
-    const { pcId, monthsPaid } = req.body;
+    const { pcId, monthsPaid, ownershipExtra } = req.body;
 
     if (!pcId || typeof pcId !== "string") {
       return res.status(400).json({ error: "Missing or invalid pcId" });
@@ -1044,14 +1055,14 @@ app.post("/buyout-quote", async (req, res) => {
 
     const { baseRent, pcValue, displayName } = await getPcOrThrow(pcId);
 
-    const ownershipExtra = 25; // or whatever your ownership credit amount is
+    const safeOwnershipExtra = Number(ownershipExtra || 0);
 
     const pricing = buildPricing({
         baseRent,
         pcValue,
         months: safeMonthsPaid,
         buyout: true,
-        ownershipExtra
+        ownershipExtra: safeOwnershipExtra
     });
 
     res.json({
