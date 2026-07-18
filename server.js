@@ -1034,7 +1034,7 @@ app.post("/verify-session", async (req, res) => {
 /* ================= BUYOUT QUOTE ================= */
 app.post("/buyout-quote", async (req, res) => {
   try {
-    const { pcId, monthsPaid, ownershipExtra } = req.body;
+    const { pcId, monthsPaid } = req.body;
 
     if (!pcId || typeof pcId !== "string") {
       return res.status(400).json({ error: "Missing or invalid pcId" });
