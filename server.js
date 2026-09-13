@@ -1587,7 +1587,16 @@ function register({ app, db, admin, env = process.env, fetchImpl = globalThis.fe
     const count = (counts.get(peer) || 0) + 1; counts.set(peer, count); total++;
     if (count > 240 || total > 2000) throw fail("Too many requests. Please try later or email us.", 429);
   }
-  const readSettings = snap => checkSettings(snap.exists ? snap.data() : { hours: {}, closedDates: [] });
+  const readSettings = snap => {
+    const stored = snap.exists ? snap.data() : { hours: {}, closedDates: [] };
+    const hours = Object.fromEntries(
+      Object.entries(stored.hours || {}).map(([day, ranges]) => [
+        day,
+        ranges.map(range => Array.isArray(range) ? range : [range.start, range.end])
+      ])
+    );
+    return checkSettings({ hours, closedDates: stored.closedDates || [] });
+  };
   const recordSummary = b => ({ id: b.id, totalCents: b.totalCents, label: new Date(b.arrival * 1000).toLocaleString("en-US", { timeZone: TZ, weekday: "long", month: "long", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" }) });
   async function authorize(req) {
     const header = req.headers.authorization || "";
@@ -1642,7 +1651,16 @@ function register({ app, db, admin, env = process.env, fetchImpl = globalThis.fe
     },
     admin: async req => {
       await authorize(req);
-      if (req.body.settings) await settingsRef.set(checkSettings(req.body.settings));
+      if (req.body.settings) {
+        const settings = checkSettings(req.body.settings);
+        const hours = Object.fromEntries(
+          Object.entries(settings.hours).map(([day, ranges]) => [
+            day,
+            ranges.map(([start, end]) => ({ start, end }))
+          ])
+        );
+        await settingsRef.set({ hours, closedDates: settings.closedDates });
+      }
       if (req.body.cancel) {
         const id = clean(req.body, "cancel", 32, 32);
         if (!/^[a-f0-9]{32}$/.test(id)) throw fail("Invalid booking.");
