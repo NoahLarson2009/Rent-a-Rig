@@ -328,7 +328,18 @@ app.post("/webhook", express.raw({ type: "application/json" }), async (req, res)
 });
 
 // ================= NORMAL JSON (AFTER WEBHOOK) =================
-app.use(express.json());
+app.use(express.json({ limit: "32kb" }));
+
+// Disable new custom computer orders, including direct API requests.
+app.post(["/custom-build-deposit", "/custom-build-to-rental", "/finish-build"], (req, res) => {
+  res.status(410).json({ error: "Custom computer orders are unavailable. Mobile assembly uses customer-provided parts." });
+});
+app.post("/checkout", (req, res, next) => {
+  if (req.body?.originalCustomBuildOrderId) {
+    return res.status(410).json({ error: "Custom computer checkout is unavailable." });
+  }
+  next();
+});
 
 if (!process.env.STRIPE_SECRET_KEY) {
   throw new Error("Missing STRIPE_SECRET_KEY in .env");
@@ -355,90 +366,6 @@ if (!admin.apps.length) {
     storageBucket: `${process.env.FIREBASE_PROJECT_ID}.appspot.com`
   });
 }
-
-app.post("/custom-build-deposit", async (req, res) => {
-    try {
-        const {
-            userId,
-            fullName,
-            email,
-            phone,
-            gpu,
-            cpu,
-            motherboard,
-            ram,
-            cooler,
-            case: pcCase,
-            psu,
-            storage,
-            pcpartpickerLink,
-            notes
-        } = req.body;
-
-        // ✅ REQUIRE LOGIN NOW
-        if (!userId) {
-            return res.status(401).json({
-                error: "You must be logged in."
-            });
-        }
-
-        if (!fullName || !email || !phone || !gpu || !cpu) {
-            return res.status(400).json({
-                error: "Missing required fields."
-            });
-        }
-
-        const session = await stripe.checkout.sessions.create({
-            mode: "payment",
-            customer_email: email,
-
-            line_items: [
-                {
-                    price_data: {
-                        currency: "usd",
-                        product_data: {
-                            name: "Custom PC Build Deposit",
-                            description: "Refundable after first rental payment."
-                        },
-                        unit_amount: 10000
-                    },
-                    quantity: 1
-                }
-            ],
-
-            metadata: {
-                type: "custom_build_deposit",
-                userId: String(userId),
-                fullName,
-                email,
-                phone,
-                gpu,
-                cpu,
-                motherboard: motherboard || "",
-                ram: ram || "",
-                cooler: cooler || "",
-                case: pcCase || "",
-                psu: psu || "",
-                storage: storage || "",
-                pcpartpickerLink: pcpartpickerLink || "",
-                notes: notes || ""
-            },
-
-            success_url: `${process.env.SUCCESS_URL}?type=build_deposit&session_id={CHECKOUT_SESSION_ID}`,
-            cancel_url: `${process.env.CANCEL_URL}`
-        });
-
-        res.json({
-            url: session.url
-        });
-
-    } catch (err) {
-        console.error("CUSTOM BUILD DEPOSIT ERROR:", err);
-        res.status(500).json({
-            error: err.message
-        });
-    }
-});
 
 const db = admin.firestore();
 
@@ -1435,167 +1362,6 @@ app.post("/cancel-order", async (req, res) => {
   }
 });
 
-/* ================= CUSTOM BUILD TO RENTAL (ADMIN ONLY) ================= */
-app.post("/custom-build-to-rental", async (req, res) => {
-  try {
-    const authHeader = req.headers.authorization || "";
-
-    if (!authHeader.startsWith("Bearer ")) {
-      return res.status(401).json({ error: "Missing auth token" });
-    }
-
-    const idToken = authHeader.split("Bearer ")[1];
-    const decodedToken = await admin.auth().verifyIdToken(idToken);
-
-    if (decodedToken.email !== "noahlarson2009@gmail.com") {
-      return res.status(403).json({ error: "Only the admin can make rentals" });
-    }
-
-    const { orderId, monthlyPrice } = req.body;
-    const priceNumber = Number(monthlyPrice);
-
-    if (!orderId || typeof orderId !== "string") {
-      return res.status(400).json({ error: "Missing orderId" });
-    }
-
-    if (!Number.isFinite(priceNumber) || priceNumber <= 0) {
-      return res.status(400).json({ error: "Invalid monthly price" });
-    }
-
-    const orderRef = db.collection("orders").doc(orderId);
-    const orderSnap = await orderRef.get();
-
-    if (!orderSnap.exists) {
-      return res.status(404).json({ error: "Order not found" });
-    }
-
-    const order = orderSnap.data() || {};
-
-    if (order.orderType !== "custom_build_deposit") {
-      return res.status(400).json({ error: "This is not a custom build order" });
-    }
-
-    await orderRef.update({
-      orderType: "rental",
-      pcName: "Custom PC Rental",
-
-      totalPerMonth: priceNumber,
-      rentPerMonth: priceNumber,
-      months: 12,
-      monthsPaid: 0,
-
-      buyout: false,
-      paymentStatus: "pending",
-      status: "pending",
-
-      convertedFromCustomBuild: true,
-      convertedFromCustomBuildAt: admin.firestore.FieldValue.serverTimestamp(),
-      rentalCreatedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    await mailer.sendMail({
-      from: process.env.EMAIL_USER,
-      to: order.userEmail,
-      bcc: process.env.BUSINESS_EMAIL || "",
-      subject: "Your Custom PC Rental Order Is Ready",
-      text: `
-Hello ${order.fullName || ""},
-
-Your custom PC build has been turned into a rental order.
-
-Monthly price: $${priceNumber.toFixed(2)}
-
-Log in and view your order here:
-https://rent-a-gaming-rig.com/orders.html
-
-Your order is pending until it is activated.
-
-Thank you.
-      `.trim()
-    });
-
-    res.json({
-      success: true
-    });
-
-  } catch (err) {
-    console.error("CUSTOM BUILD TO RENTAL ERROR:", err);
-    res.status(500).json({
-      error: err.message || "Failed to make custom build into rental"
-    });
-  }
-});
-
-/* ================= FINISH BUILD ================= */
-app.post("/finish-build", async (req, res) => {
-  try {
-    const authHeader = req.headers.authorization || "";
-
-    if (!authHeader.startsWith("Bearer ")) {
-      return res.status(401).json({ error: "Missing token" });
-    }
-
-    const idToken = authHeader.split("Bearer ")[1];
-    const decoded = await admin.auth().verifyIdToken(idToken);
-
-    if (decoded.email !== "noahlarson2009@gmail.com") {
-      return res.status(403).json({ error: "Admin only" });
-    }
-
-    const { orderId, image, pcValue, totalPerMonth, rentPerMonth } = req.body;
-
-    if (!orderId || !image) {
-      return res.status(400).json({ error: "Missing data" });
-    }
-
-    const ref = db.collection("orders").doc(orderId);
-
-    const orderSnap = await ref.get();
-
-    if (!orderSnap.exists) {
-      return res.status(404).json({ error: "Order not found" });
-    }
-
-    const order = orderSnap.data() || {};
-
-    await ref.update({
-      readyForRent: true,
-      image,
-      pcValue: Number(pcValue),
-      totalPerMonth: Number(totalPerMonth),
-      rentPerMonth: Number(rentPerMonth),
-      finishedAt: admin.firestore.FieldValue.serverTimestamp(),
-      finishedEmailSent: true,
-      finishedEmailSentAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    await mailer.sendMail({
-      from: process.env.EMAIL_USER,
-      to: order.userEmail,
-      bcc: process.env.BUSINESS_EMAIL || "",
-      subject: "Your Custom PC Build Is Finished",
-      text: `
-Hello ${order.fullName || ""},
-
-Your custom PC build is finished and ready to rent.
-
-Monthly price: $${Number(totalPerMonth || 0).toFixed(2)}
-
-You can view and rent it from your orders page here:
-https://rent-a-gaming-rig.com/orders.html
-
-Thank you.
-      `.trim()
-    });
-
-    res.json({ success: true });
-
-  } catch (err) {
-    console.error("FINISH BUILD ERROR:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
 /* ================= ACTIVATE ORDER (ADMIN ONLY) ================= */
 app.post("/activate-order", async (req, res) => {
   try {
@@ -1680,6 +1446,227 @@ app.post("/delete-order", async (req, res) => {
     });
   }
 });
+
+
+/* ================= MOBILE SERVICES: private routing and scheduling ================= */
+(() => {
+const crypto = require("node:crypto");
+const TZ = "America/Chicago";
+const FEES = { diagnostic: [2000, 30], assembly: [5000, 60], both: [7000, 90] };
+const fail = (message, status = 400) => Object.assign(new Error(message), { status });
+const clock = new Intl.DateTimeFormat("en-CA", {
+  timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit",
+  hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23"
+});
+function parts(seconds) {
+  return Object.fromEntries(clock.formatToParts(new Date(seconds * 1000)).map(p => [p.type, p.value]));
+}
+function dateAt(seconds) {
+  const p = parts(seconds); return `${p.year}-${p.month}-${p.day}`;
+}
+function validDate(value) {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) throw fail("Choose a valid date.");
+  const d = new Date(value + "T12:00:00Z");
+  if (!Number.isFinite(d.getTime()) || d.toISOString().slice(0, 10) !== value) throw fail("Choose a valid date.");
+  return value;
+}
+// Convert local Central Time to an epoch without assuming a fixed UTC offset.
+function epoch(day, minute) {
+  const target = Date.parse(day + "T00:00:00Z") / 1000 + minute * 60;
+  let result = target;
+  for (let i = 0; i < 4; i++) {
+    const p = parts(result);
+    const shown = Date.parse(`${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}:${p.second}Z`) / 1000;
+    const correction = target - shown;
+    result += correction;
+    if (!correction) break;
+  }
+  const p = parts(result);
+  return dateAt(result) === day && Number(p.hour) * 60 + Number(p.minute) === minute ? result : null;
+}
+function clean(body, name, max, min = 1) {
+  const v = body[name];
+  if (typeof v !== "string" || v.trim().length < min || v.trim().length > max) throw fail(`Check the ${name} field.`);
+  return v.trim();
+}
+function checkSettings(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw fail("Invalid schedule.");
+  const hours = {};
+  for (const [day, ranges] of Object.entries(input.hours || {})) {
+    if (!/^[0-6]$/.test(day) || !Array.isArray(ranges) || ranges.length > 4) throw fail("Invalid working hours.");
+    hours[day] = ranges.map(range => {
+      if (!Array.isArray(range) || range.length !== 2 || !range.every(t => typeof t === "string" && /^([01]\d|2[0-3]):[0-5]\d$/.test(t)) || range[0] >= range[1]) throw fail("Hours must start and finish on the same day, with closing after opening.");
+      return range;
+    }).sort((a, b) => a[0].localeCompare(b[0]));
+    for (let i = 1; i < hours[day].length; i++) if (hours[day][i][0] < hours[day][i - 1][1]) throw fail("Working windows cannot overlap.");
+  }
+  const closedDates = input.closedDates || [];
+  if (!Array.isArray(closedDates) || closedDates.length > 200) throw fail("Invalid closed dates.");
+  closedDates.forEach(validDate);
+  return { hours, closedDates };
+}
+function available(q, day, settings, bookings, now = Date.now() / 1000) {
+  validDate(day);
+  if (day < dateAt(now) || day > dateAt(now + 60 * 86400)) throw fail("Choose a date within the next 60 days.");
+  if (settings.closedDates.includes(day)) return [];
+  // Monday=0 through Sunday=6.
+  const weekday = (new Date(day + "T12:00:00Z").getUTCDay() + 6) % 7;
+  const minutes = t => Number(t.slice(0, 2)) * 60 + Number(t.slice(3));
+  const windows = (settings.hours[weekday] || []).map(([a, b]) => [epoch(day, minutes(a)), epoch(day, minutes(b))]).filter(w => w.every(v => v !== null));
+  const result = [];
+  for (let m = 0; m < 1440; m += 15) {
+    const arrival = epoch(day, m);
+    if (arrival === null) continue;
+    const start = arrival - q.outMinutes * 60;
+    // Conservative allowance requested by owner: keep the full round trip
+    // plus service unavailable after the selected appointment time. The next
+    // appointment also needs its outbound drive before its selected time.
+    const end = arrival + (q.outMinutes + FEES[q.service][1] + q.backMinutes) * 60;
+    if (start < now + 3600 || !windows.some(([a, b]) => start >= a && end <= b)) continue;
+    if (bookings.some(b => start < b.end && end > b.start)) continue;
+    result.push({ arrival, label: new Date(arrival * 1000).toLocaleTimeString("en-US", { timeZone: TZ, hour: "numeric", minute: "2-digit" }) });
+  }
+  return result;
+}
+function register({ app, db, admin, env = process.env, fetchImpl = globalThis.fetch }) {
+  const store = db.collection("mobileServicePrivate");
+  const settingsRef = store.doc("settings");
+  const now = () => Date.now() / 1000;
+  const adminEmail = env.MOBILE_ADMIN_EMAIL || "noahlarson2009@gmail.com";
+  const wrap = fn => async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    try { res.json(await fn(req)); }
+    catch (e) {
+      if (!e.status) console.error("Mobile service request failed:", e.code || e.name);
+      res.status(e.status || 500).json({ error: e.status ? e.message : "Unable to complete this request. Please try again or email us." });
+    }
+  };
+  const key = () => {
+    if (!env.MOBILE_BOOKING_SECRET || env.MOBILE_BOOKING_SECRET.length < 32) throw fail("Online booking is not connected yet. Please email rentarig21@gmail.com.", 503);
+    return crypto.createHash("sha256").update("mobile-pc-v1:" + env.MOBILE_BOOKING_SECRET).digest();
+  };
+  // Encrypted authenticated quotes: no private origin or API key is sent to the browser.
+  function seal(q) {
+    const iv = crypto.randomBytes(12), cipher = crypto.createCipheriv("aes-256-gcm", key(), iv);
+    const bytes = Buffer.concat([cipher.update(JSON.stringify(q), "utf8"), cipher.final()]);
+    return Buffer.concat([iv, cipher.getAuthTag(), bytes]).toString("base64url");
+  }
+  function unseal(token) {
+    const secret = key();
+    try {
+      if (typeof token !== "string" || token.length > 5000) throw Error();
+      const bytes = Buffer.from(token, "base64url"), decipher = crypto.createDecipheriv("aes-256-gcm", secret, bytes.subarray(0, 12));
+      decipher.setAuthTag(bytes.subarray(12, 28));
+      const q = JSON.parse(Buffer.concat([decipher.update(bytes.subarray(28)), decipher.final()]).toString("utf8"));
+      if (!FEES[q.service] || !/^[a-f0-9]{32}$/.test(q.nonce)) throw Error();
+      return q;
+    } catch { throw fail("Please calculate a new estimate.", 410); }
+  }
+  const quoteFresh = q => { if (q.expires < now()) throw fail("Your quote expired. Please calculate a new estimate.", 410); };
+  async function route(from, to) {
+    if (!env.MOBILE_ORIGIN_ADDRESS || !env.GOOGLE_MAPS_API_KEY) throw fail("Online estimates are not connected yet. Please email rentarig21@gmail.com.", 503);
+    try {
+      const r = await fetchImpl("https://routes.googleapis.com/directions/v2:computeRoutes", {
+        method: "POST", signal: AbortSignal.timeout(20000),
+        headers: { "Content-Type": "application/json", "X-Goog-Api-Key": env.GOOGLE_MAPS_API_KEY, "X-Goog-FieldMask": "routes.distanceMeters,routes.duration" },
+        body: JSON.stringify({ origin: { address: from }, destination: { address: to }, travelMode: "DRIVE", routingPreference: "TRAFFIC_UNAWARE" })
+      });
+      if (!r.ok) throw Error();
+      const data = (await r.json()).routes?.[0];
+      const meters = Number(data?.distanceMeters), seconds = Number(data?.duration?.replace(/s$/, ""));
+      if (!Number.isFinite(meters) || meters < 0 || !Number.isFinite(seconds) || seconds < 0) throw Error();
+      return { meters, minutes: Math.ceil(seconds / 60) };
+    } catch { throw fail("Could not calculate that route. Check the complete address and ZIP or email us for a quote.", 422); }
+  }
+  // Basic per-process limit. The key is the socket peer, not an untrusted forwarded header.
+  let period = 0, total = 0; const counts = new Map();
+  function limit(req) {
+    const hour = Math.floor(now() / 3600);
+    if (hour !== period) { period = hour; total = 0; counts.clear(); }
+    const peer = req.socket?.remoteAddress || "unknown";
+    const count = (counts.get(peer) || 0) + 1; counts.set(peer, count); total++;
+    if (count > 240 || total > 2000) throw fail("Too many requests. Please try later or email us.", 429);
+  }
+  const readSettings = snap => checkSettings(snap.exists ? snap.data() : { hours: {}, closedDates: [] });
+  const recordSummary = b => ({ id: b.id, totalCents: b.totalCents, label: new Date(b.arrival * 1000).toLocaleString("en-US", { timeZone: TZ, weekday: "long", month: "long", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" }) });
+  async function authorize(req) {
+    const header = req.headers.authorization || "";
+    if (!header.startsWith("Bearer ")) throw fail("Sign in with your owner account.", 401);
+    let user;
+    try { user = await admin.auth().verifyIdToken(header.slice(7), true); }
+    catch { throw fail("Please sign in again.", 401); }
+    if (user.email !== adminEmail || user.email_verified !== true) throw fail("Owner access only.", 403);
+    return user;
+  }
+  const handlers = {
+    quote: async req => {
+      limit(req); key();
+      const address = clean(req.body, "address", 300, 12), service = req.body.service;
+      if (!Object.hasOwn(FEES, service)) throw fail("Choose a service.");
+      const [out, back] = await Promise.all([route(env.MOBILE_ORIGIN_ADDRESS, address), route(address, env.MOBILE_ORIGIN_ADDRESS)]);
+      const miles = Math.round(out.meters / 1609.344 * 100) / 100;
+      if (miles > Number(env.MOBILE_MAX_MILES || 100)) throw fail("This address is outside online booking range. Please email us to discuss a visit.");
+      const travelCents = Math.round(miles * 50), [serviceCents, serviceMinutes] = FEES[service];
+      const q = { nonce: crypto.randomBytes(16).toString("hex"), address, service, miles, travelCents, outMinutes: out.minutes, backMinutes: back.minutes, expires: now() + 1800 };
+      return { id: seal(q), miles, travelCents, serviceCents, totalCents: travelCents + serviceCents };
+    },
+    slots: async req => {
+      limit(req); const q = unseal(req.body.quoteId); quoteFresh(q);
+      const day = validDate(req.body.date);
+      const [settings, calendar] = await Promise.all([settingsRef.get(), store.doc("day_" + day).get()]);
+      return { slots: available(q, day, readSettings(settings), calendar.data()?.intervals || []), message: "No times available. Choose another day or email us to arrange your visit." };
+    },
+    book: async req => {
+      limit(req); const q = unseal(req.body.quoteId);
+      const arrival = req.body.arrival;
+      if (!Number.isSafeInteger(arrival) || arrival < 0 || arrival > 4102444800) throw fail("Choose an available arrival time.");
+      const name = clean(req.body, "name", 100), email = clean(req.body, "email", 200), phone = clean(req.body, "phone", 40, 7), notes = clean(req.body, "notes", 2000, 0);
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw fail("Enter a valid email.");
+      const day = dateAt(arrival), ref = store.doc("booking_" + q.nonce), dayRef = store.doc("day_" + day);
+      return db.runTransaction(async tx => {
+        const old = await tx.get(ref);
+        if (old.exists) {
+          if (old.data().status !== "booked") throw fail("This visit was canceled. Calculate a new estimate.", 409);
+          return recordSummary(old.data());
+        }
+        quoteFresh(q);
+        const settings = await tx.get(settingsRef), calendar = await tx.get(dayRef);
+        const intervals = calendar.data()?.intervals || [];
+        if (!available(q, day, readSettings(settings), intervals).some(s => s.arrival === arrival)) throw fail("That time is no longer available. Choose another arrival time.", 409);
+        const start = arrival - q.outMinutes * 60, end = arrival + (q.outMinutes + FEES[q.service][1] + q.backMinutes) * 60;
+        const booking = { id: q.nonce, day, arrival, start, end, name, email, phone, notes, address: q.address, service: q.service, miles: q.miles, travelCents: q.travelCents, totalCents: q.travelCents + FEES[q.service][0], status: "booked", createdAt: now() };
+        tx.set(ref, booking);
+        tx.set(dayRef, { intervals: [...intervals, { id: q.nonce, start, end }], bookingIds: [...(calendar.data()?.bookingIds || []), q.nonce] });
+        return recordSummary(booking);
+      });
+    },
+    admin: async req => {
+      await authorize(req);
+      if (req.body.settings) await settingsRef.set(checkSettings(req.body.settings));
+      if (req.body.cancel) {
+        const id = clean(req.body, "cancel", 32, 32);
+        if (!/^[a-f0-9]{32}$/.test(id)) throw fail("Invalid booking.");
+        await db.runTransaction(async tx => {
+          const ref = store.doc("booking_" + id), snap = await tx.get(ref);
+          if (!snap.exists) throw fail("Booking not found.", 404);
+          const dayRef = store.doc("day_" + snap.data().day), calendar = await tx.get(dayRef);
+          tx.update(ref, { status: "canceled" });
+          tx.set(dayRef, { ...calendar.data(), intervals: (calendar.data()?.intervals || []).filter(i => i.id !== id) });
+        });
+      }
+      const day = validDate(req.body.date || dateAt(now()));
+      const [settings, calendar] = await Promise.all([settingsRef.get(), store.doc("day_" + day).get()]);
+      const ids = calendar.data()?.bookingIds || [];
+      const snapshots = await Promise.all(ids.map(id => store.doc("booking_" + id).get()));
+      return { settings: readSettings(settings), date: day, bookings: snapshots.filter(s => s.exists).map(s => s.data()).sort((a, b) => a.arrival - b.arrival) };
+    }
+  };
+  for (const [name, handler] of Object.entries(handlers)) app.post("/api/mobile/" + name, wrap(handler));
+  return handlers;
+}
+
+register({ app, db, admin });
+})();
 
 /* ================= START SERVER ================= */
 const PORT = process.env.PORT || 3001;
