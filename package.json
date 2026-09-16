@@ -1,10 +1,11 @@
 {
-  "name": "rent-rig-backend",
+  "name": "zizz1es-computer-market",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "PC marketplace with one-time purchases and 3DMark value comparisons",
+  "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test tests/*.test.cjs"
   },
   "keywords": [],
   "author": "",
@@ -17,5 +18,8 @@
     "firebase-admin": "^13.8.0",
     "nodemailer": "^8.0.7",
     "stripe": "^22.0.2"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }
