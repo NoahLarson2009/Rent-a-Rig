@@ -12,7 +12,12 @@ app.use(cors({ origin: "*" }));
 // ================= WEBHOOK (MUST BE BEFORE express.json) =================
 app.post("/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   try {
-    const event = JSON.parse(req.body.toString());
+    // Only process events actually signed by the configured Stripe endpoint.
+    const event = stripe.webhooks.constructEvent(
+      req.body,
+      req.headers["stripe-signature"],
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
 
     console.log("WEBHOOK RECEIVED:", event.type);
 
@@ -133,21 +138,16 @@ app.post("/webhook", express.raw({ type: "application/json" }), async (req, res)
 
     if (event.type === "invoice.payment_succeeded" || event.type === "invoice.paid") {
         const invoice = event.data.object;
-        const invoiceId = invoice.id;
-
-        if (!invoiceId) {
-            console.log("No invoice ID found.");
-            return res.json({ received: true });
-        }
-        const sub =
+        const sub = stripeObjectId(
             invoice.subscription ||
             invoice.parent?.subscription_details?.subscription ||
             invoice.lines?.data?.[0]?.parent?.subscription_item_details?.subscription ||
-            null;
+            null
+        );
 
-        console.log("invoice.payment_succeeded subscription:", sub);
+        console.log("Paid invoice subscription:", sub, "invoice:", invoice.id);
 
-        if (!sub) {
+        if (!sub || !invoice.id) {
             console.log("No subscription ID on invoice.");
             return res.json({ received: true });
         }
@@ -159,70 +159,9 @@ app.post("/webhook", express.raw({ type: "application/json" }), async (req, res)
         console.log("Matching orders found:", snap.size);
 
         for (const docSnap of snap.docs) {
-            const order = docSnap.data();
-
-            const paidInvoiceIds = Array.isArray(order.paidInvoiceIds)
-                ? order.paidInvoiceIds
-                : [];
-
-            if (paidInvoiceIds.includes(invoiceId)) {
-                console.log("Invoice already counted:", invoiceId);
-                continue;
-            }
-
-            const oldMonthsPaid = Number(order.monthsPaid || 0);
-            const totalMonths = Number(order.months || 0);
-            const newMonthsPaid = oldMonthsPaid + 1;
-
-            console.log(
-                "Updating order",
-                docSnap.id,
-                "from",
-                oldMonthsPaid,
-                "to",
-                newMonthsPaid,
-                "out of",
-                totalMonths
-            );
-
-            await docSnap.ref.update({
-                monthsPaid: newMonthsPaid,
-                paidInvoiceIds: [...paidInvoiceIds, invoiceId], // ✅ THIS FIXES IT
-                paymentStatus: "paid",
-                missedPaymentResolved: true,
-                missedPaymentDeadlineMs: admin.firestore.FieldValue.delete(),
-                returnRequired: false,
-                status: order.status === "payment_overdue" ? "active" : order.status
-            });
-
-                        if (totalMonths > 0 && newMonthsPaid >= totalMonths) {
-                await stripe.subscriptions.cancel(sub);
-
-                await docSnap.ref.update({
-                    cancelAtPeriodEnd: false,
-                    status: "completed",
-                    buyoutEmailSent: true,
-                    buyoutEmailSentAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-
-                if (order.buyout === true && order.buyoutEmailSent !== true) {
-                    try {
-                        await sendBuyoutReadyEmail(
-                            {
-                                ...order,
-                                monthsPaid: newMonthsPaid
-                            },
-                            docSnap.id
-                        );
-
-                        console.log("BUYOUT EMAIL SENT TO:", order.userEmail);
-                    } catch (emailErr) {
-                        console.error("BUYOUT EMAIL ERROR:", emailErr);
-                    }
-                }
-
-                console.log("Subscription cancelled after exact payment count:", sub);
-            }
+            // Rebuild the count from Stripe instead of incrementing it for each
+            // event. Stripe can deliver both event types and retry either one.
+            await syncOrderPayments(docSnap.ref, { paidInvoice: invoice });
         }
 
         if (snap.empty) {
@@ -232,11 +171,12 @@ app.post("/webhook", express.raw({ type: "application/json" }), async (req, res)
 
     if (event.type === "invoice.payment_failed") {
         const invoice = event.data.object;
-        const sub =
+        const sub = stripeObjectId(
             invoice.subscription ||
             invoice.parent?.subscription_details?.subscription ||
             invoice.lines?.data?.[0]?.parent?.subscription_item_details?.subscription ||
-            null;
+            null
+        );
 
         console.log("invoice.payment_failed subscription:", sub);
 
@@ -257,6 +197,7 @@ app.post("/webhook", express.raw({ type: "application/json" }), async (req, res)
                 paymentStatus: "missed_payment",
                 status: "payment_overdue",
                 missedPaymentAt: admin.firestore.FieldValue.serverTimestamp(),
+                missedInvoiceId: invoice.id || "",
                 missedPaymentDeadlineMs,
                 missedPaymentResolved: false,
                 returnRequired: false
@@ -332,6 +273,9 @@ app.use(express.json());
 
 if (!process.env.STRIPE_SECRET_KEY) {
   throw new Error("Missing STRIPE_SECRET_KEY in .env");
+}
+if (!process.env.STRIPE_WEBHOOK_SECRET) {
+  throw new Error("Missing STRIPE_WEBHOOK_SECRET in .env");
 }
 if (!process.env.FIREBASE_PROJECT_ID) {
   throw new Error("Missing FIREBASE_PROJECT_ID in .env");
@@ -556,6 +500,164 @@ app.get("/", (req, res) => {
 });
 
 /* ================= HELPERS ================= */
+function stripeObjectId(value) {
+  return typeof value === "string" ? value : value?.id || null;
+}
+
+function isPaidRentalMonth(invoice) {
+  return Boolean(
+    invoice?.id &&
+    invoice.status === "paid" &&
+    ["subscription_create", "subscription_cycle"].includes(invoice.billing_reason) &&
+    Number(invoice.total) > 0
+  );
+}
+
+// Count the initial monthly invoice and each paid renewal once. A separate
+// invoice for a plan change, a free trial, or a one-time charge is not a month.
+async function getPaidRentalInvoiceIds(subscriptionId) {
+  const ids = new Set();
+  let startingAfter;
+
+  do {
+    const params = { subscription: subscriptionId, status: "paid", limit: 100 };
+    if (startingAfter) params.starting_after = startingAfter;
+    const page = await stripe.invoices.list(params);
+    for (const invoice of page.data) {
+      if (isPaidRentalMonth(invoice)) ids.add(invoice.id);
+    }
+    if (!page.has_more) break;
+    if (!page.data.length) throw new Error("Stripe returned an incomplete invoice page");
+    startingAfter = page.data[page.data.length - 1].id;
+  } while (true);
+
+  return [...ids].sort();
+}
+
+async function completePaidRental(orderRef, subscriptionId) {
+  const orderSnap = await orderRef.get();
+  if (!orderSnap.exists) return;
+  const order = orderSnap.data() || {};
+  const totalMonths = Number(order.months || 0);
+  if (order.stripeSubscriptionId !== subscriptionId || totalMonths <= 0 ||
+      Number(order.monthsPaid || 0) < totalMonths) return;
+
+  // Preserve the existing business rule: stop charging once all agreed
+  // monthly payments have been collected.
+  const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+  if (subscription.status !== "canceled") {
+    try {
+      await stripe.subscriptions.cancel(subscriptionId);
+    } catch (err) {
+      // A simultaneous webhook or refresh may already have canceled it.
+      const latest = await stripe.subscriptions.retrieve(subscriptionId);
+      if (latest.status !== "canceled") throw err;
+    }
+  }
+
+  const notificationOrder = await db.runTransaction(async (tx) => {
+    const currentSnap = await tx.get(orderRef);
+    if (!currentSnap.exists) return null;
+    const current = currentSnap.data() || {};
+    const required = Number(current.months || 0);
+    if (current.stripeSubscriptionId !== subscriptionId || required <= 0 ||
+        Number(current.monthsPaid || 0) < required) return null;
+
+    const update = { cancelAtPeriodEnd: false };
+    if (current.status !== "bought_out") update.status = "completed";
+    if (!current.cancelledAt) update.cancelledAt = admin.firestore.FieldValue.serverTimestamp();
+
+    const notify = current.buyout === true && current.buyoutEmailSent !== true &&
+      Boolean(current.userEmail) &&
+      Number(current.pcValue || 0) - Number(current.ownershipRate || 0) * Number(current.monthsPaid || 0) > 0;
+    if (notify) {
+      // Claim this notification transactionally so concurrent webhook deliveries
+      // don't send the same buyout email multiple times.
+      update.buyoutEmailSent = true;
+      update.buyoutEmailSentAt = admin.firestore.FieldValue.serverTimestamp();
+    }
+    tx.update(orderRef, update);
+    return notify ? current : null;
+  });
+
+  if (notificationOrder) {
+    try {
+      await sendBuyoutReadyEmail(notificationOrder, orderRef.id);
+    } catch (err) {
+      console.error("BUYOUT EMAIL ERROR:", err);
+    }
+  }
+}
+
+// Reconcile with Stripe even when a webhook was missed or counted twice.
+// A revision check forces overlapping syncs to reload rather than allowing an
+// older invoice snapshot to overwrite a newer one.
+async function syncOrderPayments(orderRef, { paidInvoice } = {}) {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const startSnap = await orderRef.get();
+    if (!startSnap.exists) throw new Error("Order not found");
+    const start = startSnap.data() || {};
+    const subscriptionId = start.stripeSubscriptionId;
+    if (!subscriptionId || typeof subscriptionId !== "string") {
+      throw new Error("This order has no Stripe subscription ID");
+    }
+
+    const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+    if (!start.userId || subscription.metadata?.userId !== start.userId) {
+      throw new Error("Stripe subscription does not match the order owner");
+    }
+    const invoiceIds = await getPaidRentalInvoiceIds(subscriptionId);
+    const revision = Number(start.stripePaymentSyncRevision || 0);
+
+    const result = await db.runTransaction(async (tx) => {
+      const currentSnap = await tx.get(orderRef);
+      if (!currentSnap.exists) throw new Error("Order not found");
+      const current = currentSnap.data() || {};
+      if (current.stripeSubscriptionId !== subscriptionId || current.userId !== start.userId ||
+          Number(current.stripePaymentSyncRevision || 0) !== revision) {
+        return { retry: true };
+      }
+
+      const monthsPaid = invoiceIds.length;
+      const totalMonths = Math.max(0, Number(current.months || 0));
+      const update = {
+        monthsPaid,
+        monthsLeft: Math.max(totalMonths - monthsPaid, 0),
+        paidInvoiceIds: invoiceIds,
+        stripePaymentSyncRevision: revision + 1,
+        stripePaymentsSyncedAt: admin.firestore.FieldValue.serverTimestamp()
+      };
+      if (current.buyout) {
+        update.remainingBuyout = Math.max(
+          Number(current.pcValue || 0) - Number(current.ownershipRate || 0) * monthsPaid,
+          0
+        ).toFixed(2);
+      }
+
+      const resolvingMissedInvoice = current.missedInvoiceId
+        ? invoiceIds.includes(current.missedInvoiceId)
+        : paidInvoice && isPaidRentalMonth(paidInvoice) && invoiceIds.includes(paidInvoice.id);
+      if (resolvingMissedInvoice &&
+          (current.paymentStatus === "missed_payment" || current.status === "payment_overdue")) {
+        update.paymentStatus = "paid";
+        update.missedPaymentResolved = true;
+        update.missedPaymentDeadlineMs = admin.firestore.FieldValue.delete();
+        update.missedInvoiceId = admin.firestore.FieldValue.delete();
+        update.returnRequired = false;
+        if (current.status === "payment_overdue") update.status = "active";
+      }
+
+      tx.update(orderRef, update);
+      return { monthsPaid, monthsLeft: update.monthsLeft, subscriptionId };
+    });
+
+    if (result.retry) continue;
+    await completePaidRental(orderRef, subscriptionId);
+    return result;
+  }
+  throw new Error("Payment synchronization was busy; please retry");
+}
+
 function toMoneyNumber(value, fallback = 0) {
   const num = Number(value);
   return Number.isFinite(num) ? num : fallback;
@@ -856,6 +958,46 @@ app.post("/checkout", async (req, res) => {
   }
 });
 
+/* ================= SYNC AN EXISTING RENTAL WITH STRIPE ================= */
+app.post("/sync-order-payments", async (req, res) => {
+  const authHeader = req.headers.authorization || "";
+  if (!authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Missing auth token" });
+  }
+
+  let decodedToken;
+  try {
+    decodedToken = await admin.auth().verifyIdToken(authHeader.slice(7));
+  } catch (err) {
+    return res.status(401).json({ error: "Invalid or expired auth token" });
+  }
+
+  try {
+    const { orderId } = req.body || {};
+    if (!orderId || typeof orderId !== "string" || orderId.includes("/")) {
+      return res.status(400).json({ error: "Missing or invalid orderId" });
+    }
+    const orderRef = db.collection("orders").doc(orderId);
+    const orderSnap = await orderRef.get();
+    if (!orderSnap.exists) return res.status(404).json({ error: "Order not found" });
+
+    const order = orderSnap.data() || {};
+    const isAdmin = decodedToken.email === "noahlarson2009@gmail.com";
+    if (order.userId !== decodedToken.uid && !isAdmin) {
+      return res.status(403).json({ error: "Not your order" });
+    }
+    if (!order.stripeSubscriptionId) {
+      return res.status(400).json({ error: "This order has no Stripe subscription" });
+    }
+
+    const result = await syncOrderPayments(orderRef);
+    res.json({ success: true, monthsPaid: result.monthsPaid, monthsLeft: result.monthsLeft });
+  } catch (err) {
+    console.error("STRIPE PAYMENT SYNC ERROR:", err);
+    res.status(500).json({ error: "Unable to sync this order with Stripe. Please try again." });
+  }
+});
+
 /* ================= VERIFY STRIPE SESSION ================= */
 app.post("/verify-session", async (req, res) => {
   try {
@@ -908,17 +1050,12 @@ app.post("/verify-session", async (req, res) => {
       : session.subscription;
 
     const months = Number(metadata.months);
-    const isOneMonth = months <= 1;
 
     const remainingBuyout = Math.max(
       Number(metadata.pcValue || 0) -
       (Number(metadata.ownershipRate || 0) * 1),
       0
     );
-
-    if (subscriptionId && isOneMonth) {
-      await stripe.subscriptions.cancel(subscriptionId);
-    }
 
     const order = {
       userId: metadata.userId || "",
@@ -947,16 +1084,18 @@ app.post("/verify-session", async (req, res) => {
       pcValue: Number(metadata.pcValue || 0),
       months,
       monthsPaid: 1,
+      monthsLeft: Math.max(months - 1, 0),
+      paidInvoiceIds: [],
       buyout: metadata.buyout === "true",
       multiplier: Number(metadata.multiplier || 1),
       ownershipRate: Number(metadata.ownershipRate || 0),
       remainingBuyout: remainingBuyout.toFixed(2),
       rentPerMonth: Number(metadata.rentPerMonth || 0),
       totalPerMonth: Number(metadata.totalPerMonth || 0),
-      paymentStatus: isOneMonth ? "cancelled" : "paid",
-      status: isOneMonth ? "completed" : "pending",
+      paymentStatus: "paid",
+      status: "pending",
       stripeSubscriptionId: subscriptionId || "",
-      cancelledAt: isOneMonth ? Date.now() : null
+      cancelledAt: null
     };
 
     const orderRef = db.collection("orders").doc(sessionId);
@@ -1004,6 +1143,10 @@ app.post("/verify-session", async (req, res) => {
         });   
     });
 
+    // The first invoice webhook can arrive before the order exists. Reconcile
+    // after saving the order so that initial payment is counted exactly once.
+    await syncOrderPayments(orderRef);
+
     if (metadata.originalCustomBuildOrderId) {
       const customOrderRef = db.collection("orders").doc(metadata.originalCustomBuildOrderId);
       const customOrderSnap = await customOrderRef.get();
@@ -1042,9 +1185,10 @@ app.post("/verify-session", async (req, res) => {
       }
     }
 
+    const savedOrder = await orderRef.get();
     res.json({
       paid: true,
-      order
+      order: savedOrder.data()
     });
 
   } catch (err) {
@@ -1119,9 +1263,7 @@ app.post("/buyout", async (req, res) => {
       return res.status(404).json({ error: "Order not found" });
     }
 
-    const order = orderSnap.data() || {};
-    const status = String(order.status || "").toLowerCase();
-    const monthsPaid = Number(order.monthsPaid || 0);
+    let order = orderSnap.data() || {};
 
     const isAdmin = decodedToken.email === "noahlarson2009@gmail.com";
     if (order.userId !== decodedToken.uid && !isAdmin) {
@@ -1132,17 +1274,16 @@ app.post("/buyout", async (req, res) => {
       return res.status(400).json({ error: "Buyout is not enabled for this order" });
     }
 
+    // Don't calculate eligibility or ownership credit from stale order data.
+    await syncOrderPayments(orderRef);
+    order = (await orderRef.get()).data() || {};
+    const status = String(order.status || "").toLowerCase();
+    const monthsPaid = Number(order.monthsPaid || 0);
+
     if (order.buyoutPaid === true || status === "bought_out") {
       return res.status(400).json({ error: "This order has already been bought out" });
     }
 
-    if (monthsPaid < 3) {
-      return res.status(400).json({
-        error: "Buyout unlocks after 3 months of payments."
-      });
-    }
-
-    // 🔥 allow active orders too
     if (monthsPaid < 3) {
       return res.status(400).json({
         error: "Buyout unlocks after 3 months of payments."
@@ -1231,7 +1372,20 @@ app.post("/buyout", async (req, res) => {
 /* ================= CANCEL ORDER ================= */
 app.post("/cancel-order", async (req, res) => {
   try {
-    const { orderId, userId } = req.body;
+    const authHeader = req.headers.authorization || "";
+    if (!authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "Missing auth token" });
+    }
+    let decodedToken;
+    try {
+      decodedToken = await admin.auth().verifyIdToken(authHeader.slice(7));
+    } catch (err) {
+      return res.status(401).json({ error: "Invalid or expired auth token" });
+    }
+    const { orderId } = req.body || {};
+    if (!orderId || typeof orderId !== "string" || orderId.includes("/")) {
+      return res.status(400).json({ error: "Missing or invalid orderId" });
+    }
 
     const orderRef = db.collection("orders").doc(orderId);
     const orderSnap = await orderRef.get();
@@ -1240,10 +1394,16 @@ app.post("/cancel-order", async (req, res) => {
       return res.status(404).json({ error: "Order not found" });
     }
 
-    const order = orderSnap.data();
+    let order = orderSnap.data();
 
-    if (order.userId !== userId && order.userEmail !== req.body.email) {
+    const isAdmin = decodedToken.email === "noahlarson2009@gmail.com";
+    if (order.userId !== decodedToken.uid && !isAdmin) {
       return res.status(403).json({ error: "Not your order" });
+    }
+
+    if (order.stripeSubscriptionId) {
+      await syncOrderPayments(orderRef);
+      order = (await orderRef.get()).data() || {};
     }
 
     if (order.cancelRefundProcessed === true) {
