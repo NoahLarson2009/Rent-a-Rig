@@ -252,7 +252,9 @@ app.post("/webhook", express.raw({ type: "application/json" }), async (req, res)
             await docSnap.ref.update({
                 cancelAtPeriodEnd: false,
                 paymentStatus: "cancelled",
-                status: monthsPaid >= totalMonths ? "completed" : "cancelled",
+                status: order.inventoryConflict === true
+                  ? "cancelled"
+                  : monthsPaid >= totalMonths ? "completed" : "cancelled",
                 cancelledAt: admin.firestore.FieldValue.serverTimestamp()
             });
         }
@@ -539,7 +541,7 @@ async function completePaidRental(orderRef, subscriptionId) {
   if (!orderSnap.exists) return;
   const order = orderSnap.data() || {};
   const totalMonths = Number(order.months || 0);
-  if (order.stripeSubscriptionId !== subscriptionId || totalMonths <= 0 ||
+  if (order.inventoryConflict === true || order.stripeSubscriptionId !== subscriptionId || totalMonths <= 0 ||
       Number(order.monthsPaid || 0) < totalMonths) return;
 
   // Preserve the existing business rule: stop charging once all agreed
@@ -560,7 +562,7 @@ async function completePaidRental(orderRef, subscriptionId) {
     if (!currentSnap.exists) return null;
     const current = currentSnap.data() || {};
     const required = Number(current.months || 0);
-    if (current.stripeSubscriptionId !== subscriptionId || required <= 0 ||
+    if (current.inventoryConflict === true || current.stripeSubscriptionId !== subscriptionId || required <= 0 ||
         Number(current.monthsPaid || 0) < required) return null;
 
     const update = { cancelAtPeriodEnd: false };
@@ -858,6 +860,10 @@ app.post("/checkout", async (req, res) => {
       if (!pcSnap.exists) {
         return res.status(404).json({ error: "PC not found" });
       }
+
+      if (pcSnap.data()?.available !== true) {
+        return res.status(409).json({ error: "This PC is no longer available to rent." });
+      }
     }
 
     const session = await stripe.checkout.sessions.create({
@@ -1110,38 +1116,94 @@ app.post("/verify-session", async (req, res) => {
     }
 
     await db.runTransaction(async (tx) => {
-        const existingOrder = await tx.get(orderRef);
+      const existingOrder = await tx.get(orderRef);
+      const existing = existingOrder.exists ? (existingOrder.data() || {}) : null;
 
-        if (existingOrder.exists) {
-            return;
-        }
+      // A prior visit must not make a PC unavailable again after the admin
+      // deliberately relisted it. Older active orders get one repair attempt.
+      const canRepairOldOrder = existing && !existing.listingAvailabilityFinalized &&
+        ["pending", "active", "payment_overdue", "cancelling"].includes(
+          String(existing.status || "pending").toLowerCase()
+        );
+      const shouldClaimListing = Boolean(pcRef && (!existing || canRepairOldOrder));
+      const pcSnap = shouldClaimListing ? await tx.get(pcRef) : null;
+      let inventoryConflict = existing?.inventoryConflict === true;
+      let inventoryConflictReason = existing?.inventoryConflictReason || "";
 
-        let pcSnap = null;
+      if (shouldClaimListing) {
+        if (!pcSnap.exists) {
+          // An older order may have been fulfilled before its listing was
+          // deleted. Only a newly finalized payment is a new conflict.
+          if (!existing) {
+            inventoryConflict = true;
+            inventoryConflictReason = "listing_missing";
+          }
+        } else {
+          const listing = pcSnap.data() || {};
+          const alreadyClaimedForOrder = existing && listing.rented === true &&
+            listing.rentedBy === order.userId;
 
-        if (pcRef) {
-            pcSnap = await tx.get(pcRef);
-
-            if (!pcSnap.exists) {
-                throw new Error("PC listing not found.");
+          if (listing.available === true) {
+            tx.update(pcRef, {
+              available: false,
+              rented: true,
+              rentedBy: order.userId,
+              rentedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+          } else if (!alreadyClaimedForOrder) {
+            // A second customer may already have paid while both checkouts
+            // were open. Keep their paid order, but never reassign this PC.
+            // For legacy orders the current listing may have been deliberately
+            // relisted, so don't cancel an older customer's subscription.
+            if (!existing) {
+              inventoryConflict = true;
+              inventoryConflictReason = "listing_unavailable";
             }
-        }    
+          }
+        }
+      }
 
-        tx.set(orderRef, {
-            ...order,
-            stripeSessionId: sessionId,
-            status: order.status || "pending",
-            paymentStatus: order.paymentStatus || "paid",
-            createdAt: admin.firestore.FieldValue.serverTimestamp()
-        });
+      if (existing) {
+        if (shouldClaimListing) {
+          tx.update(orderRef, {
+            listingAvailabilityFinalized: true,
+            inventoryConflict,
+            inventoryConflictReason
+          });
+        }
+        return;
+      }
 
-        tx.set(paymentRef, {
-            finalized: true,
-            stripeSessionId: sessionId,
-            userId: order.userId,
-            pcId: order.pcId,
-           finalizedAt: admin.firestore.FieldValue.serverTimestamp()
-        });   
+      tx.set(orderRef, {
+        ...order,
+        stripeSessionId: sessionId,
+        status: order.status || "pending",
+        paymentStatus: order.paymentStatus || "paid",
+        listingAvailabilityFinalized: true,
+        inventoryConflict,
+        inventoryConflictReason,
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+
+      tx.set(paymentRef, {
+        finalized: true,
+        stripeSessionId: sessionId,
+        userId: order.userId,
+        pcId: order.pcId,
+        finalizedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
     });
+
+    // If two people paid from already-open checkout sessions, stop future
+    // renewals for the second order while the business resolves the payment.
+    const finalizedOrder = await orderRef.get();
+    if (finalizedOrder.data()?.inventoryConflict && subscriptionId) {
+      const conflictSubscription = await stripe.subscriptions.retrieve(subscriptionId);
+      if (!["canceled", "incomplete_expired"].includes(conflictSubscription.status) &&
+          !conflictSubscription.cancel_at_period_end) {
+        await stripe.subscriptions.update(subscriptionId, { cancel_at_period_end: true });
+      }
+    }
 
     // The first invoice webhook can arrive before the order exists. Reconcile
     // after saving the order so that initial payment is counted exactly once.
@@ -1188,6 +1250,7 @@ app.post("/verify-session", async (req, res) => {
     const savedOrder = await orderRef.get();
     res.json({
       paid: true,
+      inventoryConflict: savedOrder.data()?.inventoryConflict === true,
       order: savedOrder.data()
     });
 
@@ -1279,6 +1342,10 @@ app.post("/buyout", async (req, res) => {
     order = (await orderRef.get()).data() || {};
     const status = String(order.status || "").toLowerCase();
     const monthsPaid = Number(order.monthsPaid || 0);
+
+    if (order.inventoryConflict === true) {
+      return res.status(400).json({ error: "This order needs an inventory issue resolved before buyout." });
+    }
 
     if (order.buyoutPaid === true || status === "bought_out") {
       return res.status(400).json({ error: "This order has already been bought out" });
