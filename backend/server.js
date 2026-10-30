@@ -675,21 +675,14 @@ function clampMonths(value) {
 
 function buildPricing({ baseRent, pcValue, months, buyout, ownershipExtra }) {
 
+  // Include 40% of the full base rent as ownership credit, rounded down to $5.
+  const includedOwnership = buyout ? Math.floor((baseRent * 0.40) / 5) * 5 : 0;
   const ownershipRate = buyout
-    ? Number(ownershipExtra || 0)
+    ? Math.max(includedOwnership, Number(ownershipExtra || 0))
     : 0;
 
-  // Remove 20% from normal rent when rent-to-own is enabled
-  const discountedRent = buyout
-    ? baseRent * 0.8
-    : baseRent;
-
-  // Add ownership credit after discount
-  const totalPerMonth = buyout
-    ? discountedRent + ownershipRate
-    : baseRent;
-
-  const rentPerMonth = discountedRent;
+  const rentPerMonth = baseRent - includedOwnership;
+  const totalPerMonth = rentPerMonth + ownershipRate;
 
   const totalOwnership = ownershipRate * months;
 
@@ -878,7 +871,7 @@ app.post("/checkout", async (req, res) => {
                         name: displayName,
                         description: [
                             `PC ID: ${pcId}`,
-                            `Base Rent: $${(safeBuyout ? baseRent * 0.8 : baseRent).toFixed(2)}/mo`,
+                            `Rent portion: $${rentPerMonth.toFixed(2)}/mo`,
                             `Buyout: ${safeBuyout ? "Enabled" : "Disabled"}`,
                             `Months Selected: ${safeMonths}`,
                             `Ownership Credit: $${ownershipRate.toFixed(2)}/mo`,
@@ -928,6 +921,7 @@ app.post("/checkout", async (req, res) => {
                         ownershipRate: ownershipRate.toFixed(2),
                         remainingBuyout: remainingBuyout.toFixed(2),
                         rentPerMonth: rentPerMonth.toFixed(2),
+                        baseRent: baseRent.toFixed(2),
                         totalPerMonth: totalPerMonth.toFixed(2)
                 }
         },
@@ -1097,6 +1091,7 @@ app.post("/verify-session", async (req, res) => {
       ownershipRate: Number(metadata.ownershipRate || 0),
       remainingBuyout: remainingBuyout.toFixed(2),
       rentPerMonth: Number(metadata.rentPerMonth || 0),
+      ...(Number(metadata.baseRent) > 0 ? { baseRent: Number(metadata.baseRent) } : {}),
       totalPerMonth: Number(metadata.totalPerMonth || 0),
       paymentStatus: "paid",
       status: "pending",
@@ -1569,9 +1564,12 @@ app.post("/cancel-order", async (req, res) => {
     const totalPerMonth = Number(order.totalPerMonth || 0);
     const rentPerMonth = Number(order.rentPerMonth || 0);
 
-    const normalBaseRent = order.buyout === true
-      ? rentPerMonth + 25
-      : rentPerMonth;
+    // Use the base price captured when the order was created. Preserve the
+    // legacy calculation for older orders which do not have a saved base price.
+    const savedBaseRent = Number(order.baseRent);
+    const normalBaseRent = Number.isFinite(savedBaseRent) && savedBaseRent > 0
+      ? savedBaseRent
+      : order.buyout === true ? rentPerMonth + 25 : rentPerMonth;
 
     const extraPaidPerMonth = Math.max(totalPerMonth - normalBaseRent, 0);
     let remainingRefund = Math.round(extraPaidPerMonth * monthsPaid * 100);
