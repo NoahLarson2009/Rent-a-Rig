@@ -723,7 +723,7 @@ async function getPcOrThrow(pcId) {
       : toMoneyNumber(pc.pcValue);
 
   const pcValue = displayValue;
-  const baseRent = Math.ceil((displayValue / 18) / 5) * 5;
+  const baseRent = Math.ceil((displayValue / 12) / 5) * 5;
 
   if (pcValue < 0) {
     const err = new Error("Invalid PC pcValue in Firestore");
