@@ -470,7 +470,7 @@ async function sendBuyoutReadyEmail(order, orderId) {
   const pcValue = Number(order.pcValue || 0);
   const ownershipRate = Number(order.ownershipRate || 0);
   const monthsPaid = Number(order.monthsPaid || 0);
-  const remainingBuyout = Math.max(pcValue - (ownershipRate * monthsPaid), 0);
+  const remainingBuyout = getRemainingBuyout(order, monthsPaid);
 
   if (remainingBuyout <= 0) return;
 
@@ -536,6 +536,78 @@ async function getPaidRentalInvoiceIds(subscriptionId) {
   return [...ids].sort();
 }
 
+// Only refund payments associated with this rental's paid invoices. The
+// invoice payment API is used by recent Stripe versions; older versions
+// expose the payment intent or charge directly on the invoice.
+async function getRentalInvoiceCharges(subscriptionId) {
+  const invoiceIds = await getPaidRentalInvoiceIds(subscriptionId);
+  const invoices = [];
+
+  for (const invoiceId of invoiceIds) {
+    let payments = [];
+    if (stripe.invoicePayments && typeof stripe.invoicePayments.list === "function") {
+      let startingAfter;
+      do {
+        const params = { invoice: invoiceId, status: "paid", limit: 100 };
+        if (startingAfter) params.starting_after = startingAfter;
+        const page = await stripe.invoicePayments.list(params);
+        payments.push(...page.data.map((item) => ({
+          paymentIntent: stripeObjectId(item.payment?.payment_intent),
+          charge: stripeObjectId(item.payment?.charge),
+          amount: Number(item.amount_paid || 0)
+        })));
+        if (!page.has_more) break;
+        if (!page.data.length) throw new Error("Stripe returned an incomplete invoice payment page");
+        startingAfter = page.data[page.data.length - 1].id;
+      } while (true);
+    } else {
+      const invoice = await stripe.invoices.retrieve(invoiceId);
+      payments = [{
+        paymentIntent: stripeObjectId(invoice.payment_intent),
+        charge: stripeObjectId(invoice.charge),
+        amount: Number(invoice.amount_paid || 0)
+      }];
+    }
+
+    const charges = [];
+    for (const payment of payments) {
+      let charge;
+      if (payment.charge) {
+        charge = await stripe.charges.retrieve(payment.charge);
+      } else if (payment.paymentIntent) {
+        const intent = await stripe.paymentIntents.retrieve(payment.paymentIntent, { expand: ["latest_charge"] });
+        charge = typeof intent.latest_charge === "object"
+          ? intent.latest_charge
+          : intent.latest_charge ? await stripe.charges.retrieve(intent.latest_charge) : null;
+      }
+      if (charge?.id && charge.status === "succeeded" && payment.amount > 0) {
+        charges.push({ charge, allocation: payment.amount });
+      }
+    }
+    invoices.push({ invoiceId, charges });
+  }
+  return invoices;
+}
+
+async function getOrderRefundsForCharge(chargeId, orderId, reason = "rent_to_own_extra_cancel_refund") {
+  const refunds = [];
+  let startingAfter;
+  do {
+    const params = { charge: chargeId, limit: 100 };
+    if (startingAfter) params.starting_after = startingAfter;
+    const page = await stripe.refunds.list(params);
+    refunds.push(...page.data.filter((refund) =>
+      refund.metadata?.orderId === orderId &&
+      refund.metadata?.reason === reason &&
+      refund.status !== "failed" && refund.status !== "canceled"
+    ));
+    if (!page.has_more) break;
+    if (!page.data.length) throw new Error("Stripe returned an incomplete refund page");
+    startingAfter = page.data[page.data.length - 1].id;
+  } while (true);
+  return refunds;
+}
+
 async function completePaidRental(orderRef, subscriptionId) {
   const orderSnap = await orderRef.get();
   if (!orderSnap.exists) return;
@@ -571,7 +643,7 @@ async function completePaidRental(orderRef, subscriptionId) {
 
     const notify = current.buyout === true && current.buyoutEmailSent !== true &&
       Boolean(current.userEmail) &&
-      Number(current.pcValue || 0) - Number(current.ownershipRate || 0) * Number(current.monthsPaid || 0) > 0;
+      getRemainingBuyout(current) > 0;
     if (notify) {
       // Claim this notification transactionally so concurrent webhook deliveries
       // don't send the same buyout email multiple times.
@@ -630,10 +702,7 @@ async function syncOrderPayments(orderRef, { paidInvoice } = {}) {
         stripePaymentsSyncedAt: admin.firestore.FieldValue.serverTimestamp()
       };
       if (current.buyout) {
-        update.remainingBuyout = Math.max(
-          Number(current.pcValue || 0) - Number(current.ownershipRate || 0) * monthsPaid,
-          0
-        ).toFixed(2);
+        update.remainingBuyout = getRemainingBuyout(current, monthsPaid).toFixed(2);
       }
 
       const resolvingMissedInvoice = current.missedInvoiceId
@@ -673,10 +742,18 @@ function clampMonths(value) {
   return Math.floor(num);
 }
 
+function getRemainingBuyout(order, monthsPaid = Number(order.monthsPaid || 0)) {
+  const credit = Math.max(
+    Number(order.ownershipRate || 0) * monthsPaid - Number(order.ownershipCreditRefunded || 0),
+    0
+  );
+  return Math.max(Number(order.pcValue || 0) - credit, 0);
+}
+
 function buildPricing({ baseRent, pcValue, months, buyout, ownershipExtra }) {
 
-  // Include 40% of the full base rent as ownership credit, rounded down to $5.
-  const includedOwnership = buyout ? Math.floor((baseRent * 0.40) / 5) * 5 : 0;
+  // Split the full rent-to-own price; ordinary rent uses the same rent portion.
+  const includedOwnership = Math.floor((baseRent * 0.40) / 5) * 5;
   const ownershipRate = buyout
     ? Math.max(includedOwnership, Number(ownershipExtra || 0))
     : 0;
@@ -798,7 +875,9 @@ app.post("/checkout", async (req, res) => {
 
       pc = orderData;
       pcValue = Number(orderData.pcValue || 0);
-      baseRent = Number(orderData.totalPerMonth || 0);
+      baseRent = Number(orderData.baseRent) > 0
+        ? Number(orderData.baseRent)
+        : Math.ceil((pcValue / 12) / 5) * 5;
       displayName = orderData.pcName || "Custom PC Rental";
     } else {
       const result = await getPcOrThrow(pcId);
@@ -839,8 +918,14 @@ app.post("/checkout", async (req, res) => {
         totalPerMonth
     });
 
-    if (!Number.isFinite(totalPerMonth) || totalPerMonth <= 0) {
-      return res.status(400).json({ error: "Calculated monthly total is invalid" });
+    if (!Number.isFinite(totalPerMonth) || totalPerMonth <= 0 || !Number.isFinite(pcValue) || pcValue <= 0) {
+      return res.status(400).json({ error: "Calculated monthly total or PC value is invalid" });
+    }
+    if (safeBuyout && safeMonths < 3) {
+      return res.status(400).json({ error: "Minimum term for rent-to-own is 3 months." });
+    }
+    if (!Number.isFinite(ownershipRate) || (safeBuyout && totalOwnership > pcValue)) {
+      return res.status(400).json({ error: "Ownership payments exceed the PC value." });
     }
 
     let pcRef = null;
@@ -922,6 +1007,7 @@ app.post("/checkout", async (req, res) => {
                         remainingBuyout: remainingBuyout.toFixed(2),
                         rentPerMonth: rentPerMonth.toFixed(2),
                         baseRent: baseRent.toFixed(2),
+                        standardRent: rentPerMonth.toFixed(2),
                         totalPerMonth: totalPerMonth.toFixed(2)
                 }
         },
@@ -1092,6 +1178,8 @@ app.post("/verify-session", async (req, res) => {
       remainingBuyout: remainingBuyout.toFixed(2),
       rentPerMonth: Number(metadata.rentPerMonth || 0),
       ...(Number(metadata.baseRent) > 0 ? { baseRent: Number(metadata.baseRent) } : {}),
+      ...(metadata.standardRent != null && Number.isFinite(Number(metadata.standardRent))
+        ? { standardRent: Number(metadata.standardRent) } : {}),
       totalPerMonth: Number(metadata.totalPerMonth || 0),
       paymentStatus: "paid",
       status: "pending",
@@ -1373,10 +1461,7 @@ app.post("/buyout", async (req, res) => {
     const pcValue = Number(order.pcValue || 0);
     const ownershipRate = Number(order.ownershipRate || 0);
 
-    const remainingBuyout = Math.max(
-        pcValue - (ownershipRate * monthsPaid),
-        0
-    );
+    const remainingBuyout = getRemainingBuyout(order, monthsPaid);
 
     if (!Number.isFinite(remainingBuyout) || remainingBuyout <= 0) {
       return res.status(400).json({ error: "No remaining buyout balance" });
@@ -1475,6 +1560,9 @@ app.post("/cancel-order", async (req, res) => {
     }
 
     const status = String(order.status || "").toLowerCase();
+    if (["cancelled", "cancelling", "completed", "bought_out"].includes(status)) {
+      return res.status(400).json({ error: "This order can no longer be cancelled." });
+    }
     const refundIds = [];
     let refundAmount = 0;
 
@@ -1487,44 +1575,48 @@ app.post("/cancel-order", async (req, res) => {
         expand: ["payment_intent"]
       });
 
-      if (!session.payment_intent) {
-        throw new Error("No payment intent found on Stripe checkout session.");
-      }
-
-      const paymentIntentId =
-        typeof session.payment_intent === "object"
-          ? session.payment_intent.id
-          : session.payment_intent;
-
-      const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId, {
-        expand: ["latest_charge"]
-      });
-
-      const charge = paymentIntent.latest_charge;
-
-      if (!charge || !charge.id) {
-        throw new Error("No charge found on payment intent.");
-      }
-
-      const alreadyRefunded = Number(charge.amount_refunded || 0);
-      const chargeAmount = Number(charge.amount || 0);
-      const refundableAmount = Math.max(chargeAmount - alreadyRefunded, 0);
-
-      if (refundableAmount <= 0) {
-        throw new Error("This pending order payment is already fully refunded.");
-      }
-
-      const refund = await stripe.refunds.create({
-        charge: charge.id,
-        amount: refundableAmount,
-        metadata: {
-          orderId,
-          reason: "pending_order_full_refund"
+      let initialCharges = [];
+      if (session.payment_intent) {
+        const paymentIntent = await stripe.paymentIntents.retrieve(stripeObjectId(session.payment_intent), {
+          expand: ["latest_charge"]
+        });
+        const charge = typeof paymentIntent.latest_charge === "object"
+          ? paymentIntent.latest_charge
+          : paymentIntent.latest_charge ? await stripe.charges.retrieve(paymentIntent.latest_charge) : null;
+        if (charge?.id) initialCharges = [{ charge, allocation: Number(charge.amount || 0) }];
+      } else if (order.stripeSubscriptionId) {
+        // Subscription Checkout sessions keep their initial payment on the
+        // first invoice rather than necessarily on session.payment_intent.
+        const invoiceCharges = await getRentalInvoiceCharges(order.stripeSubscriptionId);
+        for (const invoice of invoiceCharges) {
+          const detail = await stripe.invoices.retrieve(invoice.invoiceId);
+          if (detail.billing_reason === "subscription_create") {
+            initialCharges = invoice.charges;
+            break;
+          }
         }
-      });
+      }
+      if (!initialCharges.length) throw new Error("No refundable initial payment found for this pending order.");
 
-      refundIds.push(refund.id);
-      refundAmount = refundableAmount / 100;
+      const pendingChargeIds = new Set();
+      for (const item of initialCharges) {
+        if (pendingChargeIds.has(item.charge.id)) throw new Error("Duplicate initial payment requires manual review.");
+        pendingChargeIds.add(item.charge.id);
+        const prior = await getOrderRefundsForCharge(item.charge.id, orderId, "pending_order_full_refund");
+        const priorAmount = prior.reduce((sum, refund) => sum + Number(refund.amount || 0), 0);
+        refundIds.push(...prior.map((refund) => refund.id));
+        refundAmount += priorAmount / 100;
+        const chargeRemaining = Math.max(Number(item.charge.amount || 0) - Number(item.charge.amount_refunded || 0), 0);
+        const amount = Math.min(Math.max(item.allocation - priorAmount, 0), chargeRemaining);
+        if (amount <= 0 || prior.length) continue;
+        const refund = await stripe.refunds.create({
+          charge: item.charge.id,
+          amount,
+          metadata: { orderId, reason: "pending_order_full_refund" }
+        }, { idempotencyKey: `pending-refund-${orderId}-${item.charge.id}` });
+        refundIds.push(refund.id);
+        refundAmount += amount / 100;
+      }
 
       if (order.stripeSubscriptionId) {
         try {
@@ -1534,10 +1626,15 @@ app.post("/cancel-order", async (req, res) => {
             await stripe.subscriptions.cancel(order.stripeSubscriptionId);
            }
         } catch (subErr) {
-          console.log("Subscription already cancelled or unavailable:", subErr.message);
+          const latest = await stripe.subscriptions.retrieve(order.stripeSubscriptionId);
+          if (latest.status !== "canceled") throw subErr;
         }
       }  
 
+      const pendingRefundedCredit = Math.max(
+        Number(order.ownershipCreditRefunded || 0),
+        Math.min(Number(order.ownershipRate || 0), refundAmount)
+      );
       await orderRef.update({
         status: "cancelled",
         paymentStatus: "cancelled",
@@ -1545,6 +1642,10 @@ app.post("/cancel-order", async (req, res) => {
         cancelRefundProcessed: true,
         cancelRefundAmount: refundAmount,
         cancelRefundIds: refundIds,
+        ...(order.standardRent != null && order.buyout === true ? {
+          ownershipCreditRefunded: pendingRefundedCredit,
+          remainingBuyout: getRemainingBuyout({ ...order, ownershipCreditRefunded: pendingRefundedCredit }).toFixed(2)
+        } : {}),
         cancelRefundedAt: admin.firestore.FieldValue.serverTimestamp(),
         cancelledAt: admin.firestore.FieldValue.serverTimestamp()
       });
@@ -1564,51 +1665,66 @@ app.post("/cancel-order", async (req, res) => {
     const totalPerMonth = Number(order.totalPerMonth || 0);
     const rentPerMonth = Number(order.rentPerMonth || 0);
 
-    // Use the base price captured when the order was created. Preserve the
-    // legacy calculation for older orders which do not have a saved base price.
+    // New orders save their actual rental-only rate. Keep the previous
+    // calculation for older orders so their original terms are preserved.
     const savedBaseRent = Number(order.baseRent);
-    const normalBaseRent = Number.isFinite(savedBaseRent) && savedBaseRent > 0
-      ? savedBaseRent
-      : order.buyout === true ? rentPerMonth + 25 : rentPerMonth;
+    const savedStandardRent = Number(order.standardRent);
+    const normalBaseRent = order.standardRent != null && Number.isFinite(savedStandardRent)
+      ? savedStandardRent
+      : Number.isFinite(savedBaseRent) && savedBaseRent > 0
+        ? savedBaseRent
+        : order.buyout === true ? rentPerMonth + 25 : rentPerMonth;
 
     const extraPaidPerMonth = Math.max(totalPerMonth - normalBaseRent, 0);
-    let remainingRefund = Math.round(extraPaidPerMonth * monthsPaid * 100);
+    const perInvoiceRefund = Math.round(extraPaidPerMonth * 100);
+    let remainingRefund = perInvoiceRefund * monthsPaid;
 
-    const subscription = await stripe.subscriptions.retrieve(order.stripeSubscriptionId);
+    if (remainingRefund > 0) {
+      const invoices = await getRentalInvoiceCharges(order.stripeSubscriptionId);
+      if (invoices.length !== monthsPaid) throw new Error("Rental payment count changed; please retry cancellation.");
 
-    if (!subscription.customer) {
-      throw new Error("No Stripe customer found on subscription.");
-    }
-
-    const charges = await stripe.charges.list({
-      customer: subscription.customer,
-      limit: 100
-    });
-
-    for (const charge of charges.data) {
-      if (remainingRefund <= 0) break;
-      if (charge.status !== "succeeded") continue;
-
-      const alreadyRefunded = Number(charge.amount_refunded || 0);
-      const chargeAmount = Number(charge.amount || 0);
-      const refundableAmount = Math.max(chargeAmount - alreadyRefunded, 0);
-
-      if (refundableAmount <= 0) continue;
-
-      const amountToRefund = Math.min(remainingRefund, refundableAmount);
-
-      const refund = await stripe.refunds.create({
-        charge: charge.id,
-        amount: amountToRefund,
-        metadata: {
-          orderId,
-          reason: "rent_to_own_extra_cancel_refund"
+      // Fetch previous refunds before issuing any new ones so a retry after a
+      // partial failure cannot refund the same ownership payments twice.
+      const seenCharges = new Set();
+      for (const invoice of invoices) {
+        invoice.alreadyRefunded = 0;
+        for (const item of invoice.charges) {
+          if (seenCharges.has(item.charge.id)) {
+            throw new Error("A payment is shared by multiple rental invoices; manual refund review is required.");
+          }
+          seenCharges.add(item.charge.id);
+          item.priorRefunds = await getOrderRefundsForCharge(item.charge.id, orderId);
+          invoice.alreadyRefunded += item.priorRefunds.reduce((sum, refund) => sum + Number(refund.amount || 0), 0);
+          refundIds.push(...item.priorRefunds.map((refund) => refund.id));
         }
-      });
+        remainingRefund -= Math.min(perInvoiceRefund, invoice.alreadyRefunded);
+      }
 
-      refundIds.push(refund.id);
-      remainingRefund -= amountToRefund;
+      for (const invoice of invoices) {
+        let invoiceRemaining = Math.max(perInvoiceRefund - invoice.alreadyRefunded, 0);
+        for (const item of invoice.charges) {
+          if (invoiceRemaining <= 0 || remainingRefund <= 0) break;
+          if (item.priorRefunds.length) continue;
+          const chargeRemaining = Math.max(Number(item.charge.amount || 0) - Number(item.charge.amount_refunded || 0), 0);
+          const amount = Math.min(invoiceRemaining, remainingRefund, item.allocation, chargeRemaining);
+          if (amount <= 0) continue;
+          const refund = await stripe.refunds.create({
+            charge: item.charge.id,
+            amount,
+            metadata: { orderId, invoiceId: invoice.invoiceId, reason: "rent_to_own_extra_cancel_refund" }
+          }, { idempotencyKey: `cancel-refund-${orderId}-${invoice.invoiceId}-${item.charge.id}` });
+          refundIds.push(refund.id);
+          invoiceRemaining -= amount;
+          remainingRefund -= amount;
+        }
+      }
     }
+
+    refundAmount = Math.round(extraPaidPerMonth * monthsPaid * 100) - remainingRefund;
+    // Only new pricing records receive the revised credit accounting.
+    const refundedCredit = order.standardRent != null && order.buyout === true
+      ? Math.max(Number(order.ownershipCreditRefunded || 0), refundAmount / 100)
+      : Number(order.ownershipCreditRefunded || 0);
 
     const latestSubscription = await stripe.subscriptions.retrieve(order.stripeSubscriptionId);
 
@@ -1619,7 +1735,10 @@ app.post("/cancel-order", async (req, res) => {
         cancelAtPeriodEnd: false,
         cancelRefundProcessed: true,
         cancelRefundAmount: refundAmount / 100,
+        cancelRefundRemaining: remainingRefund / 100,
         cancelRefundIds: refundIds,
+        ownershipCreditRefunded: refundedCredit,
+        remainingBuyout: getRemainingBuyout({ ...order, ownershipCreditRefunded: refundedCredit }, monthsPaid).toFixed(2),
         cancelRefundedAt: admin.firestore.FieldValue.serverTimestamp(),
         cancelledAt: admin.firestore.FieldValue.serverTimestamp()
       });
@@ -1627,6 +1746,7 @@ app.post("/cancel-order", async (req, res) => {
       return res.json({
         success: true,
         refundAmount: refundAmount / 100,
+        refundRemaining: remainingRefund / 100,
         refundIds
       });
     }
@@ -1635,20 +1755,22 @@ app.post("/cancel-order", async (req, res) => {
       cancel_at_period_end: true
     });   
 
-    refundAmount = Math.round(extraPaidPerMonth * monthsPaid * 100) - remainingRefund;
-
     await orderRef.update({
       status: "cancelling",
       cancelAtPeriodEnd: true,
       cancelRefundProcessed: true,
       cancelRefundAmount: refundAmount / 100,
+      cancelRefundRemaining: remainingRefund / 100,
       cancelRefundIds: refundIds,
+      ownershipCreditRefunded: refundedCredit,
+      remainingBuyout: getRemainingBuyout({ ...order, ownershipCreditRefunded: refundedCredit }, monthsPaid).toFixed(2),
       cancelRefundedAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
     res.json({
       success: true,
       refundAmount: refundAmount / 100,
+      refundRemaining: remainingRefund / 100,
       refundIds
     });
 
@@ -1767,11 +1889,14 @@ app.post("/finish-build", async (req, res) => {
       return res.status(403).json({ error: "Admin only" });
     }
 
-    const { orderId, image, pcValue, totalPerMonth, rentPerMonth } = req.body;
+    const { orderId, image, pcValue } = req.body;
+    const value = Number(pcValue);
 
-    if (!orderId || !image) {
-      return res.status(400).json({ error: "Missing data" });
+    if (!orderId || !image || !Number.isFinite(value) || value <= 0) {
+      return res.status(400).json({ error: "Missing data or invalid PC value" });
     }
+    const baseRent = Math.ceil((value / 12) / 5) * 5;
+    const standardRent = baseRent - Math.floor((baseRent * 0.40) / 5) * 5;
 
     const ref = db.collection("orders").doc(orderId);
 
@@ -1786,9 +1911,10 @@ app.post("/finish-build", async (req, res) => {
     await ref.update({
       readyForRent: true,
       image,
-      pcValue: Number(pcValue),
-      totalPerMonth: Number(totalPerMonth),
-      rentPerMonth: Number(rentPerMonth),
+      pcValue: value,
+      baseRent,
+      totalPerMonth: standardRent,
+      rentPerMonth: standardRent,
       finishedAt: admin.firestore.FieldValue.serverTimestamp(),
       finishedEmailSent: true,
       finishedEmailSentAt: admin.firestore.FieldValue.serverTimestamp()
@@ -1804,7 +1930,8 @@ Hello ${order.fullName || ""},
 
 Your custom PC build is finished and ready to rent.
 
-Monthly price: $${Number(totalPerMonth || 0).toFixed(2)}
+Standard rent: $${standardRent.toFixed(2)}/month
+Rent-to-own: from $${baseRent.toFixed(2)}/month
 
 You can view and rent it from your orders page here:
 https://rent-a-gaming-rig.com/orders.html
