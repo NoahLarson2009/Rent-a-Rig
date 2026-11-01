@@ -136,6 +136,10 @@ app.post("/webhook", express.raw({ type: "application/json" }), async (req, res)
         }
     }
 
+    if (event.type === "invoice.created") {
+        await addFinalBuyoutToInvoice(event.data.object);
+    }
+
     if (event.type === "invoice.payment_succeeded" || event.type === "invoice.paid") {
         const invoice = event.data.object;
         const sub = stripeObjectId(
@@ -227,9 +231,12 @@ app.post("/webhook", express.raw({ type: "application/json" }), async (req, res)
                 .get();
 
             for (const docSnap of snap.docs) {
+                const order = docSnap.data() || {};
                 await docSnap.ref.update({
                     cancelAtPeriodEnd: true,
-                    status: "cancelling"
+                    status: order.buyoutPaid === true ? "bought_out"
+                      : order.autoFinalInvoicePaid === true && !order.autoBuyoutCancellationRequested
+                        ? "payment_overdue" : "cancelling"
                 });
             }
 
@@ -251,10 +258,13 @@ app.post("/webhook", express.raw({ type: "application/json" }), async (req, res)
 
             await docSnap.ref.update({
                 cancelAtPeriodEnd: false,
-                paymentStatus: "cancelled",
-                status: order.inventoryConflict === true
-                  ? "cancelled"
-                  : monthsPaid >= totalMonths ? "completed" : "cancelled",
+                paymentStatus: order.buyoutPaid === true ? "buyout_paid"
+                  : order.autoFinalInvoicePaid && !order.autoBuyoutCancellationRequested ? "missed_payment" : "cancelled",
+                status: order.buyoutPaid === true ? "bought_out"
+                  : order.autoFinalInvoicePaid && !order.autoBuyoutCancellationRequested ? "payment_overdue"
+                  : order.inventoryConflict === true
+                    ? "cancelled"
+                    : monthsPaid >= totalMonths ? "completed" : "cancelled",
                 cancelledAt: admin.firestore.FieldValue.serverTimestamp()
             });
         }
@@ -536,6 +546,138 @@ async function getPaidRentalInvoiceIds(subscriptionId) {
   return [...ids].sort();
 }
 
+// List the original monthly invoices in Stripe billing order, even when an
+// earlier month is unpaid. The final scheduled invoice is based on the term,
+// not on how many successful-payment webhooks happened to arrive.
+async function listScheduledRentalInvoices(subscriptionId) {
+  const invoices = [];
+  let startingAfter;
+  do {
+    const params = { subscription: subscriptionId, limit: 100 };
+    if (startingAfter) params.starting_after = startingAfter;
+    const page = await stripe.invoices.list(params);
+    invoices.push(...page.data.filter((item) =>
+      ["subscription_create", "subscription_cycle"].includes(item.billing_reason)
+    ));
+    if (!page.has_more) break;
+    if (!page.data.length) throw new Error("Stripe returned an incomplete invoice page");
+    startingAfter = page.data[page.data.length - 1].id;
+  } while (true);
+  return invoices.reverse();
+}
+
+async function getFinalBuyoutLines(invoiceId) {
+  const lines = [];
+  let startingAfter;
+  do {
+    const params = { limit: 100 };
+    if (startingAfter) params.starting_after = startingAfter;
+    const page = await stripe.invoices.listLineItems(invoiceId, params);
+    for (const line of page.data) {
+      let isBuyout = line.metadata?.rtoFinalBuyout === "true";
+      const itemId = stripeObjectId(line.invoice_item || line.parent?.invoice_item_details?.invoice_item);
+      // Some Stripe API versions expose item metadata on the invoice item
+      // rather than the line. Look it up before deciding a line is absent.
+      if (!isBuyout && itemId) {
+        const item = await stripe.invoiceItems.retrieve(itemId);
+        isBuyout = item.metadata?.rtoFinalBuyout === "true";
+      }
+      if (isBuyout) lines.push(line);
+    }
+    if (!page.has_more) break;
+    if (!page.data.length) throw new Error("Stripe returned incomplete invoice lines");
+    startingAfter = page.data[page.data.length - 1].id;
+  } while (true);
+  return lines;
+}
+
+function getAutoFinalTerms(subscription) {
+  const meta = subscription.metadata || {};
+  if (meta.autoFinalBuyout !== "true" || meta.buyout !== "true") return null;
+  const months = Number(meta.months);
+  const cents = Number(meta.finalBuyoutCents);
+  if (!Number.isInteger(months) || months < 3 || months > 24 ||
+      !Number.isSafeInteger(cents) || cents < 0 || !meta.userId || !/^[0-9]+$/.test(meta.finalBuyoutCents || "")) {
+    throw new Error("Invalid automatic buyout terms on subscription");
+  }
+  return { months, cents };
+}
+
+// Runs on invoice.created before Stripe finalizes and charges the invoice.
+// Only new agreements with an explicit final-payment acceptance are eligible.
+async function addFinalBuyoutToInvoice(eventInvoice) {
+  if (eventInvoice.billing_reason !== "subscription_cycle" || !eventInvoice.id) return;
+  const subscriptionId = stripeObjectId(eventInvoice.subscription ||
+    eventInvoice.parent?.subscription_details?.subscription ||
+    eventInvoice.lines?.data?.[0]?.parent?.subscription_item_details?.subscription);
+  if (!subscriptionId) return;
+  const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+  const terms = getAutoFinalTerms(subscription);
+  if (!terms || ["canceled", "incomplete_expired"].includes(subscription.status) || subscription.cancel_at_period_end) return;
+  const scheduled = await listScheduledRentalInvoices(subscriptionId);
+  const index = scheduled.findIndex((item) => item.id === eventInvoice.id);
+  if (index < 0) throw new Error("New invoice not found in subscription invoice history");
+  if (index !== terms.months - 1) return;
+
+  const matches = await db.collection("orders").where("stripeSubscriptionId", "==", subscriptionId).get();
+  if (matches.size !== 1) throw new Error("Final buyout requires exactly one matching rental order");
+  const orderRef = matches.docs[0].ref;
+  // Serialize final-invoice preparation against early cancellation. If the
+  // invoice is already being processed, cancellation requires support review.
+  const claimed = await db.runTransaction(async (tx) => {
+    const snap = await tx.get(orderRef);
+    if (!snap.exists) throw new Error("Rental order disappeared");
+    const order = snap.data() || {};
+    if (order.stripeSubscriptionId !== subscriptionId || order.userId !== subscription.metadata.userId ||
+        order.autoFinalBuyout !== true || Math.round(Number(order.finalBuyoutAmount) * 100) !== terms.cents ||
+        Number(order.months) !== terms.months) throw new Error("Automatic buyout does not match the rental order");
+    if (order.inventoryConflict || order.autoBuyoutCancellationRequested || order.buyoutPaid ||
+        ["cancelled", "cancelling", "bought_out"].includes(String(order.status || "").toLowerCase())) return false;
+    if (order.autoFinalInvoiceId && order.autoFinalInvoiceId !== eventInvoice.id) throw new Error("Another final invoice is already recorded");
+    tx.update(orderRef, { autoFinalInvoiceId: eventInvoice.id, autoFinalInvoiceState: "preparing" });
+    return true;
+  });
+  if (!claimed) return;
+
+  const existing = await getFinalBuyoutLines(eventInvoice.id);
+  if (existing.length > 1 || (existing.length === 1 && Number(existing[0].amount) !== terms.cents)) {
+    throw new Error("Final invoice has a duplicate or incorrect buyout line");
+  }
+  if (terms.cents > 0 && existing.length === 0) {
+    const invoice = await stripe.invoices.retrieve(eventInvoice.id);
+    if (invoice.status !== "draft") throw new Error("Final invoice was finalized without its buyout; manual review required");
+    const customer = stripeObjectId(invoice.customer);
+    if (!customer) throw new Error("Final invoice has no customer");
+    await stripe.invoiceItems.create({
+      customer,
+      invoice: invoice.id,
+      currency: "usd",
+      amount: terms.cents,
+      discountable: false,
+      description: "Final rent-to-own buyout balance",
+      metadata: { rtoFinalBuyout: "true", subscriptionId }
+    }, { idempotencyKey: `rto-final-buyout-${invoice.id}` });
+  }
+  await orderRef.update({ autoFinalInvoiceState: "attached" });
+}
+
+// Do not transfer ownership unless the last scheduled invoice is actually
+// paid and contains the exact authorized buyout line (or the balance was $0).
+async function getPaidFinalBuyout(order, subscription, paidInvoiceIds) {
+  const terms = getAutoFinalTerms(subscription);
+  if (!terms || order.autoFinalBuyout !== true ||
+      Math.round(Number(order.finalBuyoutAmount) * 100) !== terms.cents ||
+      Number(order.months) !== terms.months) return null;
+  const scheduled = await listScheduledRentalInvoices(subscription.id);
+  const invoice = scheduled[terms.months - 1];
+  if (!invoice || !paidInvoiceIds.includes(invoice.id)) return null;
+  const lines = await getFinalBuyoutLines(invoice.id);
+  if (terms.cents === 0 ? lines.length !== 0 :
+      lines.length !== 1 || Number(lines[0].amount) !== terms.cents) return null;
+  return { invoiceId: invoice.id, amount: terms.cents / 100,
+    allMonthsPaid: paidInvoiceIds.length >= terms.months };
+}
+
 // Only refund payments associated with this rental's paid invoices. The
 // invoice payment API is used by recent Stripe versions; older versions
 // expose the payment intent or charge directly on the invoice.
@@ -641,7 +783,7 @@ async function completePaidRental(orderRef, subscriptionId) {
     if (current.status !== "bought_out") update.status = "completed";
     if (!current.cancelledAt) update.cancelledAt = admin.firestore.FieldValue.serverTimestamp();
 
-    const notify = current.buyout === true && current.buyoutEmailSent !== true &&
+    const notify = current.buyout === true && current.autoFinalBuyout !== true && current.buyoutPaid !== true && current.buyoutEmailSent !== true &&
       Boolean(current.userEmail) &&
       getRemainingBuyout(current) > 0;
     if (notify) {
@@ -681,6 +823,7 @@ async function syncOrderPayments(orderRef, { paidInvoice } = {}) {
       throw new Error("Stripe subscription does not match the order owner");
     }
     const invoiceIds = await getPaidRentalInvoiceIds(subscriptionId);
+    const finalBuyout = await getPaidFinalBuyout(start, subscription, invoiceIds);
     const revision = Number(start.stripePaymentSyncRevision || 0);
 
     const result = await db.runTransaction(async (tx) => {
@@ -718,11 +861,33 @@ async function syncOrderPayments(orderRef, { paidInvoice } = {}) {
         if (current.status === "payment_overdue") update.status = "active";
       }
 
+      if (finalBuyout && current.autoFinalBuyout === true && !current.autoBuyoutCancellationRequested &&
+          current.inventoryConflict !== true && !["cancelled", "cancelling"].includes(String(current.status || "").toLowerCase())) {
+        update.autoFinalInvoicePaid = true;
+        update.buyoutInvoiceId = finalBuyout.invoiceId;
+        if (finalBuyout.allMonthsPaid) {
+          update.buyoutPaid = true;
+          update.buyoutPaidAt = admin.firestore.FieldValue.serverTimestamp();
+          update.buyoutAmountPaid = finalBuyout.amount;
+          update.remainingBuyout = "0.00";
+          update.paymentStatus = "buyout_paid";
+          update.status = "bought_out";
+        } else {
+          // The final invoice was paid, but an earlier monthly invoice is still
+          // unpaid. Do not grant ownership or allow another monthly renewal.
+          update.paymentStatus = "missed_payment";
+          update.status = "payment_overdue";
+        }
+      }
       tx.update(orderRef, update);
       return { monthsPaid, monthsLeft: update.monthsLeft, subscriptionId };
     });
 
     if (result.retry) continue;
+    if (finalBuyout && !finalBuyout.allMonthsPaid && !start.autoBuyoutCancellationRequested &&
+        !subscription.cancel_at_period_end && !["canceled", "incomplete_expired"].includes(subscription.status)) {
+      await stripe.subscriptions.update(subscriptionId, { cancel_at_period_end: true });
+    }
     await completePaidRental(orderRef, subscriptionId);
     return result;
   }
@@ -840,6 +1005,9 @@ app.post("/checkout", async (req, res) => {
     buyout,
     ownershipExtra,
     ageConfirmed,
+    finalBuyoutAccepted,
+    remainingBuyout: quotedRemainingBuyout,
+    totalPerMonth: quotedTotalPerMonth,
       } = req.body;
 
     if (ageConfirmed !== true) {
@@ -927,6 +1095,12 @@ app.post("/checkout", async (req, res) => {
     if (!Number.isFinite(ownershipRate) || (safeBuyout && totalOwnership > pcValue)) {
       return res.status(400).json({ error: "Ownership payments exceed the PC value." });
     }
+    if (safeBuyout && (finalBuyoutAccepted !== true ||
+        !Number.isFinite(Number(quotedRemainingBuyout)) || !Number.isFinite(Number(quotedTotalPerMonth)) ||
+        Math.round(Number(quotedRemainingBuyout) * 100) !== Math.round(remainingBuyout * 100) ||
+        Math.round(Number(quotedTotalPerMonth) * 100) !== Math.round(totalPerMonth * 100))) {
+      return res.status(400).json({ error: "Please reload the rental page and review the final payment amount before checkout." });
+    }
 
     let pcRef = null;
 
@@ -960,7 +1134,7 @@ app.post("/checkout", async (req, res) => {
                             `Buyout: ${safeBuyout ? "Enabled" : "Disabled"}`,
                             `Months Selected: ${safeMonths}`,
                             `Ownership Credit: $${ownershipRate.toFixed(2)}/mo`,
-                            `Remaining Buyout After Term: $${remainingBuyout.toFixed(2)}`
+                            safeBuyout ? `Final month total: $${(totalPerMonth + remainingBuyout).toFixed(2)} (includes $${remainingBuyout.toFixed(2)} buyout)` : "No buyout"
                         ].join(" | "),
                         images: pc.image ? [pc.image] : []
                     },
@@ -1005,6 +1179,9 @@ app.post("/checkout", async (req, res) => {
                         buyout: String(safeBuyout),
                         ownershipRate: ownershipRate.toFixed(2),
                         remainingBuyout: remainingBuyout.toFixed(2),
+                        autoFinalBuyout: String(safeBuyout),
+                        finalBuyoutCents: String(safeBuyout ? Math.round(remainingBuyout * 100) : 0),
+                        termsVersion: "final-buyout-v1",
                         rentPerMonth: rentPerMonth.toFixed(2),
                         baseRent: baseRent.toFixed(2),
                         standardRent: rentPerMonth.toFixed(2),
@@ -1173,6 +1350,9 @@ app.post("/verify-session", async (req, res) => {
       monthsLeft: Math.max(months - 1, 0),
       paidInvoiceIds: [],
       buyout: metadata.buyout === "true",
+      autoFinalBuyout: metadata.autoFinalBuyout === "true",
+      finalBuyoutAmount: Number(metadata.finalBuyoutCents || 0) / 100,
+      termsVersion: metadata.termsVersion || "",
       multiplier: Number(metadata.multiplier || 1),
       ownershipRate: Number(metadata.ownershipRate || 0),
       remainingBuyout: remainingBuyout.toFixed(2),
@@ -1434,6 +1614,10 @@ app.post("/buyout", async (req, res) => {
       return res.status(400).json({ error: "This order has already been bought out" });
     }
 
+    if (order.autoFinalBuyout === true && status !== "cancelled") {
+      return res.status(400).json({ error: "This agreement's buyout is included in the final monthly payment. If your completed payment needs review, please contact Rent a Rig." });
+    }
+
     if (monthsPaid < 3) {
       return res.status(400).json({
         error: "Buyout unlocks after 3 months of payments."
@@ -1563,6 +1747,22 @@ app.post("/cancel-order", async (req, res) => {
     if (["cancelled", "cancelling", "completed", "bought_out"].includes(status)) {
       return res.status(400).json({ error: "This order can no longer be cancelled." });
     }
+    if (order.autoFinalBuyout === true) {
+      const outcome = await db.runTransaction(async (tx) => {
+        const currentSnap = await tx.get(orderRef);
+        if (!currentSnap.exists) throw new Error("Order not found");
+        const current = currentSnap.data() || {};
+        if (current.autoFinalInvoiceId) return "final_in_progress";
+        if (current.buyoutPaid || ["cancelled", "cancelling", "completed", "bought_out"].includes(String(current.status || "").toLowerCase())) return "ended";
+        tx.update(orderRef, { autoBuyoutCancellationRequested: true });
+        return "ok";
+      });
+      if (outcome === "final_in_progress") {
+        return res.status(409).json({ error: "Your final payment is already being processed. Please contact Rent a Rig for cancellation assistance." });
+      }
+      if (outcome === "ended") return res.status(400).json({ error: "This order can no longer be cancelled." });
+    }
+
     const refundIds = [];
     let refundAmount = 0;
 
