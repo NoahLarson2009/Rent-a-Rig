@@ -3,6 +3,7 @@ const cors = require("cors");
 const Stripe = require("stripe");
 const admin = require("firebase-admin");
 const nodemailer = require("nodemailer");
+const { randomUUID } = require("crypto");
 require("dotenv").config();
 
 const app = express();
@@ -23,6 +24,11 @@ app.post("/webhook", express.raw({ type: "application/json" }), async (req, res)
 
     if (event.type === "checkout.session.completed") {
         const checkoutSession = event.data.object;
+
+        if (checkoutSession.mode === "payment" &&
+            checkoutSession.metadata?.type === "final_buyout_recovery") {
+            await completeFinalBuyoutRecovery(checkoutSession);
+        }
 
         if (
             checkoutSession.mode === "payment" &&
@@ -231,12 +237,16 @@ app.post("/webhook", express.raw({ type: "application/json" }), async (req, res)
                 .get();
 
             for (const docSnap of snap.docs) {
-                const order = docSnap.data() || {};
-                await docSnap.ref.update({
-                    cancelAtPeriodEnd: true,
-                    status: order.buyoutPaid === true ? "bought_out"
-                      : order.autoFinalInvoicePaid === true && !order.autoBuyoutCancellationRequested
-                        ? "payment_overdue" : "cancelling"
+                await db.runTransaction(async (tx) => {
+                    const current = await tx.get(docSnap.ref);
+                    if (!current.exists) return;
+                    const order = current.data() || {};
+                    tx.update(docSnap.ref, {
+                        cancelAtPeriodEnd: true,
+                        status: order.buyoutPaid === true ? "bought_out"
+                          : order.autoFinalInvoicePaid === true && !order.autoBuyoutCancellationRequested
+                            ? "payment_overdue" : "cancelling"
+                    });
                 });
             }
 
@@ -252,20 +262,24 @@ app.post("/webhook", express.raw({ type: "application/json" }), async (req, res)
             .get();
 
         for (const docSnap of snap.docs) {
-            const order = docSnap.data();
-            const monthsPaid = Number(order.monthsPaid || 0);
-            const totalMonths = Number(order.months || 0);
-
-            await docSnap.ref.update({
-                cancelAtPeriodEnd: false,
-                paymentStatus: order.buyoutPaid === true ? "buyout_paid"
-                  : order.autoFinalInvoicePaid && !order.autoBuyoutCancellationRequested ? "missed_payment" : "cancelled",
-                status: order.buyoutPaid === true ? "bought_out"
-                  : order.autoFinalInvoicePaid && !order.autoBuyoutCancellationRequested ? "payment_overdue"
-                  : order.inventoryConflict === true
-                    ? "cancelled"
-                    : monthsPaid >= totalMonths ? "completed" : "cancelled",
-                cancelledAt: admin.firestore.FieldValue.serverTimestamp()
+            await db.runTransaction(async (tx) => {
+                const current = await tx.get(docSnap.ref);
+                if (!current.exists) return;
+                const order = current.data() || {};
+                const monthsPaid = Number(order.monthsPaid || 0);
+                const totalMonths = Number(order.months || 0);
+                tx.update(docSnap.ref, {
+                    cancelAtPeriodEnd: false,
+                    paymentStatus: order.buyoutPaid === true ? "buyout_paid"
+                      : order.autoFinalInvoicePaid && !order.autoBuyoutCancellationRequested ? "missed_payment" : "cancelled",
+                    status: order.buyoutPaid === true ? "bought_out"
+                      : order.autoFinalInvoicePaid && !order.autoBuyoutCancellationRequested ? "payment_overdue"
+                      : order.inventoryConflict === true ? "cancelled"
+                      : order.autoFinalBuyout === true && !order.autoBuyoutCancellationRequested && totalMonths > 0 && monthsPaid >= totalMonths
+                        ? (order.autoFinalBuyoutMissing ? "buyout_payment_needed" : "payment_review")
+                      : totalMonths > 0 && monthsPaid >= totalMonths ? "completed" : "cancelled",
+                    cancelledAt: order.cancelledAt || admin.firestore.FieldValue.serverTimestamp()
+                });
             });
         }
 
@@ -591,6 +605,21 @@ async function getFinalBuyoutLines(invoiceId) {
   return lines;
 }
 
+async function getAllInvoiceLines(invoiceId) {
+  const lines = [];
+  let startingAfter;
+  do {
+    const params = { limit: 100 };
+    if (startingAfter) params.starting_after = startingAfter;
+    const page = await stripe.invoices.listLineItems(invoiceId, params);
+    lines.push(...page.data);
+    if (!page.has_more) break;
+    if (!page.data.length) throw new Error("Stripe returned incomplete invoice lines");
+    startingAfter = page.data[page.data.length - 1].id;
+  } while (true);
+  return lines;
+}
+
 function getAutoFinalTerms(subscription) {
   const meta = subscription.metadata || {};
   if (meta.autoFinalBuyout !== "true" || meta.buyout !== "true") return null;
@@ -674,8 +703,187 @@ async function getPaidFinalBuyout(order, subscription, paidInvoiceIds) {
   const lines = await getFinalBuyoutLines(invoice.id);
   if (terms.cents === 0 ? lines.length !== 0 :
       lines.length !== 1 || Number(lines[0].amount) !== terms.cents) return null;
+  const requiredInvoices = scheduled.slice(0, terms.months);
   return { invoiceId: invoice.id, amount: terms.cents / 100,
-    allMonthsPaid: paidInvoiceIds.length >= terms.months };
+    allMonthsPaid: requiredInvoices.length === terms.months &&
+      requiredInvoices.every((item) => paidInvoiceIds.includes(item.id)) };
+}
+
+// A fallback checkout is allowed only when Stripe proves every scheduled
+// installment was paid, the last invoice contained only the monthly rent,
+// and no buyout line was already billed. Anything ambiguous needs review.
+async function getFinalBuyoutRecoveryQuote(order, subscription) {
+  const terms = getAutoFinalTerms(subscription);
+  if (!terms || terms.cents <= 0 || order.autoFinalBuyout !== true ||
+      order.buyoutPaid === true || order.autoBuyoutCancellationRequested || order.inventoryConflict ||
+      subscription.id !== order.stripeSubscriptionId || subscription.metadata?.userId !== order.userId ||
+      Number(order.months) !== terms.months ||
+      Math.round(Number(order.finalBuyoutAmount) * 100) !== terms.cents) return null;
+
+  const scheduled = await listScheduledRentalInvoices(subscription.id);
+  const required = scheduled.slice(0, terms.months);
+  if (required.length !== terms.months || !required.every(isPaidRentalMonth)) return null;
+  const monthlyCents = Math.round(Number(order.totalPerMonth) * 100);
+  if (!Number.isSafeInteger(monthlyCents) || monthlyCents <= 0) return null;
+  for (const invoice of required) {
+    if ((await getFinalBuyoutLines(invoice.id)).length) return null;
+    const lines = await getAllInvoiceLines(invoice.id);
+    const rentalLine = lines[0];
+    const isSubscriptionLine = rentalLine?.type === "subscription" ||
+      rentalLine?.parent?.type === "subscription_item_details" ||
+      Boolean(rentalLine?.parent?.subscription_item_details);
+    const lineSubscription = stripeObjectId(rentalLine?.subscription ||
+      rentalLine?.parent?.subscription_item_details?.subscription);
+    if (Number(invoice.subtotal) !== monthlyCents || Number(invoice.total) !== monthlyCents ||
+        lines.length !== 1 || !isSubscriptionLine ||
+        (lineSubscription && lineSubscription !== subscription.id) ||
+        Number(rentalLine.amount) !== monthlyCents) return null;
+  }
+
+  const last = await stripe.invoices.retrieve(required[required.length - 1].id);
+  if (!isPaidRentalMonth(last) || Number(last.subtotal) !== monthlyCents || Number(last.total) !== monthlyCents) return null;
+
+  return { cents: terms.cents, invoiceId: last.id, customer: stripeObjectId(subscription.customer) };
+}
+
+async function completeFinalBuyoutRecovery(session) {
+  if (session?.metadata?.type !== "final_buyout_recovery" ||
+      session.status !== "complete" || session.payment_status !== "paid") return false;
+  const orderId = session.metadata.orderId;
+  if (!orderId || orderId.includes("/")) throw new Error("Invalid recovery order");
+  const orderRef = db.collection("orders").doc(orderId);
+  const snap = await orderRef.get();
+  if (!snap.exists) throw new Error("Recovery order not found");
+  const order = snap.data() || {};
+  if (order.buyoutPaid === true) {
+    if (order.buyoutSessionId === session.id) return true;
+    throw new Error("Recovery payment needs manual review: order is already bought out");
+  }
+  const subscription = await stripe.subscriptions.retrieve(order.stripeSubscriptionId);
+  const quote = await getFinalBuyoutRecoveryQuote(order, subscription);
+  if (!quote || session.currency !== "usd" || Number(session.amount_total) !== quote.cents ||
+      session.metadata.finalInvoiceId !== quote.invoiceId ||
+      stripeObjectId(session.customer) !== quote.customer) {
+    throw new Error("Recovery payment does not match the verified rental terms");
+  }
+
+  await db.runTransaction(async (tx) => {
+    const currentSnap = await tx.get(orderRef);
+    if (!currentSnap.exists) throw new Error("Recovery order not found");
+    const current = currentSnap.data() || {};
+    if (current.buyoutPaid === true && current.buyoutSessionId === session.id) return;
+    if (current.buyoutPaid || current.autoBuyoutCancellationRequested || current.inventoryConflict ||
+        current.autoBuyoutRecoveryAttempt !== session.metadata.attempt ||
+        (current.autoBuyoutRecoverySessionId && current.autoBuyoutRecoverySessionId !== session.id) ||
+        current.stripeSubscriptionId !== subscription.id || current.userId !== order.userId ||
+        Math.round(Number(current.finalBuyoutAmount) * 100) !== quote.cents) {
+      throw new Error("Recovery payment needs manual review");
+    }
+    tx.update(orderRef, {
+      buyoutPaid: true,
+      buyoutPaidAt: admin.firestore.FieldValue.serverTimestamp(),
+      buyoutSessionId: session.id,
+      autoBuyoutRecoverySessionId: session.id,
+      buyoutAmountPaid: quote.cents / 100,
+      remainingBuyout: "0.00",
+      autoFinalBuyoutMissing: false,
+      paymentStatus: "buyout_paid",
+      status: "bought_out"
+    });
+  });
+  return true;
+}
+
+async function startFinalBuyoutRecovery(orderRef, order) {
+  const subscription = await stripe.subscriptions.retrieve(order.stripeSubscriptionId);
+  const quote = await getFinalBuyoutRecoveryQuote(order, subscription);
+  if (!quote || !quote.customer || subscription.status !== "canceled") {
+    throw new Error("This final payment needs review. Please contact Rent a Rig before paying.");
+  }
+
+  // One stored attempt and one Stripe idempotency key prevent double charges
+  // if a customer clicks twice or a request is retried.
+  for (let retry = 0; retry < 3; retry++) {
+    const recovery = await db.runTransaction(async (tx) => {
+      const currentSnap = await tx.get(orderRef);
+      if (!currentSnap.exists) throw new Error("Order not found");
+      const current = currentSnap.data() || {};
+      if (current.buyoutPaid || current.autoBuyoutCancellationRequested || current.inventoryConflict ||
+          current.stripeSubscriptionId !== subscription.id || current.userId !== order.userId ||
+          Math.round(Number(current.finalBuyoutAmount) * 100) !== quote.cents) {
+        throw new Error("This buyout needs review before payment.");
+      }
+      if (current.autoBuyoutRecoveryAttempt) {
+        return { attempt: current.autoBuyoutRecoveryAttempt,
+          sessionId: current.autoBuyoutRecoverySessionId || "",
+          startedAt: Number(current.autoBuyoutRecoveryStartedAtMs || 0) };
+      }
+      const attempt = randomUUID();
+      const startedAt = Date.now();
+      tx.update(orderRef, { autoBuyoutRecoveryAttempt: attempt, autoBuyoutRecoveryStartedAtMs: startedAt });
+      return { attempt, sessionId: "", startedAt };
+    });
+
+    let session;
+    if (recovery.sessionId) {
+      session = await stripe.checkout.sessions.retrieve(recovery.sessionId);
+    } else {
+      // Stripe's idempotency keys can expire after 24 hours. If the original
+      // response was lost for that long, do not risk creating a second charge.
+      if (!recovery.startedAt || Date.now() - recovery.startedAt > 22 * 60 * 60 * 1000) {
+        throw new Error("The previous payment attempt needs review. Please contact Rent a Rig.");
+      }
+      session = await stripe.checkout.sessions.create({
+        mode: "payment",
+        customer: quote.customer,
+        payment_method_types: ["card"],
+        line_items: [{ price_data: { currency: "usd", product_data: {
+          name: `${order.pcName || "PC Rental"} Final Buyout`,
+          description: "Remaining buyout from your rental agreement"
+        }, unit_amount: quote.cents }, quantity: 1 }],
+        metadata: { type: "final_buyout_recovery", orderId: orderRef.id,
+          attempt: recovery.attempt, finalInvoiceId: quote.invoiceId },
+        success_url: "https://rent-a-gaming-rig.com/success.html?buyout=true&session_id={CHECKOUT_SESSION_ID}",
+        cancel_url: "https://rent-a-gaming-rig.com/orders.html?buyout=cancelled"
+      }, { idempotencyKey: `rto-recovery-${orderRef.id}-${recovery.attempt}` });
+      await db.runTransaction(async (tx) => {
+        const currentSnap = await tx.get(orderRef);
+        const current = currentSnap.data() || {};
+        if (!currentSnap.exists || current.autoBuyoutRecoveryAttempt !== recovery.attempt ||
+            (current.autoBuyoutRecoverySessionId && current.autoBuyoutRecoverySessionId !== session.id)) {
+          throw new Error("The payment attempt changed; please contact Rent a Rig.");
+        }
+        tx.update(orderRef, { autoBuyoutRecoverySessionId: session.id });
+      });
+    }
+
+    if (session.metadata?.type !== "final_buyout_recovery" || session.metadata.orderId !== orderRef.id ||
+        session.metadata.attempt !== recovery.attempt || session.metadata.finalInvoiceId !== quote.invoiceId ||
+        Number(session.amount_total) !== quote.cents || session.currency !== "usd" ||
+        stripeObjectId(session.customer) !== quote.customer) {
+      throw new Error("The existing payment attempt needs review. Please contact Rent a Rig.");
+    }
+    if (session.status === "complete") {
+      if (session.payment_status === "paid") await completeFinalBuyoutRecovery(session);
+      return { alreadySubmitted: true };
+    }
+    if (session.status === "open" && session.url) return { url: session.url };
+    if (session.status !== "expired") throw new Error("Payment attempt needs review. Please contact Rent a Rig.");
+
+    // A verified expired Checkout session cannot be paid, so a fresh attempt
+    // can safely be created. Concurrent retries share the new attempt.
+    await db.runTransaction(async (tx) => {
+      const currentSnap = await tx.get(orderRef);
+      const current = currentSnap.data() || {};
+      if (currentSnap.exists && current.autoBuyoutRecoveryAttempt === recovery.attempt &&
+          current.autoBuyoutRecoverySessionId === session.id && !current.buyoutPaid) {
+        tx.update(orderRef, { autoBuyoutRecoveryAttempt: admin.firestore.FieldValue.delete(),
+          autoBuyoutRecoverySessionId: admin.firestore.FieldValue.delete(),
+          autoBuyoutRecoveryStartedAtMs: admin.firestore.FieldValue.delete() });
+      }
+    });
+  }
+  throw new Error("Unable to prepare the buyout. Please try again.");
 }
 
 // Only refund payments associated with this rental's paid invoices. The
@@ -758,6 +966,11 @@ async function completePaidRental(orderRef, subscriptionId) {
   if (order.inventoryConflict === true || order.stripeSubscriptionId !== subscriptionId || totalMonths <= 0 ||
       Number(order.monthsPaid || 0) < totalMonths) return;
 
+  // An unrelated extra paid invoice must not hide an unpaid installment.
+  const scheduled = await listScheduledRentalInvoices(subscriptionId);
+  const required = scheduled.slice(0, totalMonths);
+  if (required.length !== totalMonths || !required.every(isPaidRentalMonth)) return;
+
   // Preserve the existing business rule: stop charging once all agreed
   // monthly payments have been collected.
   const subscription = await stripe.subscriptions.retrieve(subscriptionId);
@@ -770,6 +983,9 @@ async function completePaidRental(orderRef, subscriptionId) {
       if (latest.status !== "canceled") throw err;
     }
   }
+  const recoveryQuote = order.autoFinalBuyout === true && order.buyoutPaid !== true &&
+    !order.autoBuyoutCancellationRequested
+    ? await getFinalBuyoutRecoveryQuote(order, subscription) : null;
 
   const notificationOrder = await db.runTransaction(async (tx) => {
     const currentSnap = await tx.get(orderRef);
@@ -780,7 +996,17 @@ async function completePaidRental(orderRef, subscriptionId) {
         Number(current.monthsPaid || 0) < required) return null;
 
     const update = { cancelAtPeriodEnd: false };
-    if (current.status !== "bought_out") update.status = "completed";
+    if (current.buyoutPaid === true) {
+      update.status = "bought_out";
+      update.paymentStatus = "buyout_paid";
+    } else if (current.status !== "bought_out") {
+      if (current.autoFinalBuyout === true && !current.autoBuyoutCancellationRequested && !current.buyoutPaid) {
+        update.status = recoveryQuote ? "buyout_payment_needed" : "payment_review";
+        update.autoFinalBuyoutMissing = Boolean(recoveryQuote);
+      } else {
+        update.status = "completed";
+      }
+    }
     if (!current.cancelledAt) update.cancelledAt = admin.firestore.FieldValue.serverTimestamp();
 
     const notify = current.buyout === true && current.autoFinalBuyout !== true && current.buyoutPaid !== true && current.buyoutEmailSent !== true &&
@@ -818,6 +1044,14 @@ async function syncOrderPayments(orderRef, { paidInvoice } = {}) {
       throw new Error("This order has no Stripe subscription ID");
     }
 
+    if (start.autoBuyoutRecoverySessionId && !start.buyoutPaid) {
+      const recoverySession = await stripe.checkout.sessions.retrieve(start.autoBuyoutRecoverySessionId);
+      if (recoverySession.status === "complete" && recoverySession.payment_status === "paid") {
+        await completeFinalBuyoutRecovery(recoverySession);
+        continue;
+      }
+    }
+
     const subscription = await stripe.subscriptions.retrieve(subscriptionId);
     if (!start.userId || subscription.metadata?.userId !== start.userId) {
       throw new Error("Stripe subscription does not match the order owner");
@@ -845,9 +1079,9 @@ async function syncOrderPayments(orderRef, { paidInvoice } = {}) {
         stripePaymentsSyncedAt: admin.firestore.FieldValue.serverTimestamp()
       };
       if (current.buyout) {
-        update.remainingBuyout = getRemainingBuyout(current, monthsPaid).toFixed(2);
+        update.remainingBuyout = current.buyoutPaid === true
+          ? "0.00" : getRemainingBuyout(current, monthsPaid).toFixed(2);
       }
-
       const resolvingMissedInvoice = current.missedInvoiceId
         ? invoiceIds.includes(current.missedInvoiceId)
         : paidInvoice && isPaidRentalMonth(paidInvoice) && invoiceIds.includes(paidInvoice.id);
@@ -862,7 +1096,7 @@ async function syncOrderPayments(orderRef, { paidInvoice } = {}) {
       }
 
       if (finalBuyout && current.autoFinalBuyout === true && !current.autoBuyoutCancellationRequested &&
-          current.inventoryConflict !== true && !["cancelled", "cancelling"].includes(String(current.status || "").toLowerCase())) {
+          current.inventoryConflict !== true) {
         update.autoFinalInvoicePaid = true;
         update.buyoutInvoiceId = finalBuyout.invoiceId;
         if (finalBuyout.allMonthsPaid) {
@@ -872,12 +1106,17 @@ async function syncOrderPayments(orderRef, { paidInvoice } = {}) {
           update.remainingBuyout = "0.00";
           update.paymentStatus = "buyout_paid";
           update.status = "bought_out";
+          update.autoFinalBuyoutMissing = false;
         } else {
           // The final invoice was paid, but an earlier monthly invoice is still
           // unpaid. Do not grant ownership or allow another monthly renewal.
           update.paymentStatus = "missed_payment";
           update.status = "payment_overdue";
         }
+      }
+      if (current.buyoutPaid === true) {
+        update.status = "bought_out";
+        update.paymentStatus = "buyout_paid";
       }
       tx.update(orderRef, update);
       return { monthsPaid, monthsLeft: update.monthsLeft, subscriptionId };
@@ -1615,7 +1854,11 @@ app.post("/buyout", async (req, res) => {
     }
 
     if (order.autoFinalBuyout === true && status !== "cancelled") {
-      return res.status(400).json({ error: "This agreement's buyout is included in the final monthly payment. If your completed payment needs review, please contact Rent a Rig." });
+      if (order.autoFinalBuyoutMissing !== true) {
+        return res.status(400).json({ error: "This agreement's buyout is included in the final monthly payment. If your completed payment needs review, please contact Rent a Rig." });
+      }
+      const recovery = await startFinalBuyoutRecovery(orderRef, order);
+      return res.json(recovery);
     }
 
     if (monthsPaid < 3) {
@@ -1744,7 +1987,7 @@ app.post("/cancel-order", async (req, res) => {
     }
 
     const status = String(order.status || "").toLowerCase();
-    if (["cancelled", "cancelling", "completed", "bought_out"].includes(status)) {
+    if (["cancelled", "cancelling", "completed", "bought_out", "buyout_payment_needed", "payment_review"].includes(status)) {
       return res.status(400).json({ error: "This order can no longer be cancelled." });
     }
     if (order.autoFinalBuyout === true) {
